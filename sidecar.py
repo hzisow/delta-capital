@@ -42,6 +42,7 @@ app.add_middleware(
 # ── Config ──────────────────────────────────────────────────────────────────
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "stock_cache.json")
 HISTORY_CACHE_FILE = os.path.join(os.path.dirname(__file__), "history_cache.json")
+FUNDAMENTALS_CACHE_FILE = os.path.join(os.path.dirname(__file__), "fundamentals_cache.json")
 CACHE_TTL_SECONDS = 6 * 60 * 60       # refresh anything older than 6h
 THROTTLE_INTERVAL_MIN = 0.5            # aggressive — full universe in ~7 min
 THROTTLE_INTERVAL_MAX = 3.0            # backed off when Yahoo 429s
@@ -62,6 +63,12 @@ _cache_lock = threading.Lock()
 # shape: { ticker: [[yyyy-mm, adj_close], ...] }   ~60 rows per ticker
 _history: dict[str, list] = {}
 _history_lock = threading.Lock()
+
+# annual fundamentals for point-in-time factor scoring
+# shape: { ticker: [{fiscalEnd, filed, netIncome, equity, totalDebt, ebitda, fcf, sharesOut}, ...] }
+# ~5 annual rows per ticker, sorted oldest → newest
+_fundamentals: dict[str, list] = {}
+_fundamentals_lock = threading.Lock()
 
 _throttle_lock = threading.Lock()
 _last_call_ts = 0.0

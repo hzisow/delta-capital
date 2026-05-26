@@ -1,18 +1,9 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 
-// Data flow: browser → Vite → /api proxy → Python sidecar (FastAPI + yfinance
-// + curl_cffi). The sidecar handles Yahoo's WAF for us via Chrome TLS
-// impersonation. See sidecar.py.
+// New architecture: frontend reads a static data.json refreshed hourly
+// by GitHub Actions (.github/workflows/refresh-data.yml). No sidecar,
+// no tunnel, Mac fully off. See VITE_DATA_URL in src/App.jsx.
 export default defineConfig({
   plugins: [react()],
-  server: {
-    proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:8001',
-        changeOrigin: true,
-        rewrite: (path) => path.replace(/^\/api/, ''),
-      },
-    },
-  },
 })

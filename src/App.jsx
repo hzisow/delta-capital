@@ -11,30 +11,10 @@ const CACHE_TTL = 5 * 60 * 1000; // 5 minutes — Yahoo free is already 15-min d
 // ── API ────────────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
-// Sidecar URL: production sets VITE_API_URL to the deployed Render URL,
-// local dev uses /api which proxies to localhost:8001 via vite.config.js
-const API_BASE = import.meta.env.VITE_API_URL || "/api";
-
-// One call per ticker to our Python sidecar (FastAPI + yfinance + curl_cffi).
-// The sidecar returns a unified shape already aligned to what loadData wants.
-const fetchStock = async (ticker, { fresh = false, attempt = 0 } = {}) => {
-  try {
-    const qs = fresh ? "?fresh=1" : "";
-    const r = await fetch(`${API_BASE}/stock/${encodeURIComponent(ticker)}${qs}`);
-    if (!r.ok && attempt < 2) {
-      await sleep(400 * Math.pow(2, attempt));
-      return fetchStock(ticker, { fresh, attempt: attempt + 1 });
-    }
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } catch (e) {
-    if (attempt < 2) {
-      await sleep(400 * Math.pow(2, attempt));
-      return fetchStock(ticker, { fresh, attempt: attempt + 1 });
-    }
-    throw e;
-  }
-};
+// Static data URL — refreshed hourly by GitHub Actions (see .github/workflows/refresh-data.yml).
+// Override with VITE_DATA_URL to point at a different fork or branch.
+const DATA_URL = import.meta.env.VITE_DATA_URL ||
+  "https://raw.githubusercontent.com/hzisow/delta-capital/data/data.json";
 
 const batchFetch = async (items, fn, concurrency = 8) => {
   const out = Array(items.length).fill(null);
@@ -212,63 +192,25 @@ export default function DeltaCapital() {
       setProgress(10);
 
       // If user hit Refresh, request the sidecar mark stale entries for priority
-      // refresh. The first response is still instant (from cache); we then poll
-      // every 5s to pull updated prices as the background worker catches them.
-      const bulkUrl = forceRefresh
-        ? `${API_BASE}/stocks/bulk?force_refresh_age_s=60`
-        : `${API_BASE}/stocks/bulk`;
-
-      // Fetch fundamentals + historical monthly closes in parallel
-      const [bulkRes, histRes] = await Promise.all([
-        fetch(bulkUrl),
-        fetch(`${API_BASE}/historical/bulk`).catch(() => null),
-      ]);
-      if (!bulkRes.ok) throw new Error(`Failed to load stocks (HTTP ${bulkRes.status})`);
-      const { stocks: rows, universe, cached_count, universe_count } = await bulkRes.json();
-
-      if (histRes && histRes.ok) {
-        try {
-          const histJson = await histRes.json();
-          setHistory(histJson.history || {});
-        } catch {}
-      }
+      // Single static JSON, refreshed hourly by GitHub Actions.
+      // Cache-busting query string makes the Refresh button bypass CDN cache.
+      const url = forceRefresh ? `${DATA_URL}?t=${Date.now()}` : DATA_URL;
+      const res = await fetch(url, { cache: forceRefresh ? "no-store" : "default" });
+      if (!res.ok) throw new Error(`Failed to load data.json (HTTP ${res.status})`);
+      const payload = await res.json();
       tick(1);
 
-      setProgress(80);
-      setMsg(`${cached_count}/${universe_count} stocks loaded`);
+      setHistory(payload.history || {});
+      const rows = payload.stocks || [];
 
-      // If we asked for a refresh, kick off a background poll that pulls updated
-      // data every 8 seconds until everything is < 60s old (or we hit 8 polls).
-      if (forceRefresh) {
-        let polls = 0;
-        const poll = async () => {
-          if (polls++ >= 8) return;
-          try {
-            const r = await fetch(`${API_BASE}/stocks/bulk`);
-            if (!r.ok) return;
-            const { stocks: fresh } = await r.json();
-            const merged = fresh
-              .filter(s => s && s.price > 0 && s.marketCap > 0)
-              .sort((a, b) => b.marketCap - a.marketCap);
-            setStocks(merged);
-            setScored(scoreAll(merged));
-            const now = Date.now();
-            try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: now, stocks: merged })); } catch {}
-            setLastUpdated(now);
-            tick(1);
-            // Stop polling if everything is fresh
-            const stillStale = fresh.filter(s => (s._cacheAgeS ?? 0) > 60).length;
-            if (stillStale > 0) setTimeout(poll, 8000);
-          } catch {}
-        };
-        setTimeout(poll, 8000);
-      }
+      setProgress(80);
+      setMsg(`${rows.length} stocks loaded · refreshed ${payload.generated || "?"}`);
 
       const merged = rows
         .filter(s => s && s.price > 0 && s.marketCap > 0)
         .sort((a, b) => b.marketCap - a.marketCap);
 
-      if (!merged.length) throw new Error("No data returned from Yahoo Finance. Check your connection or try again.");
+      if (!merged.length) throw new Error("No data returned. Check that the GitHub Action has run at least once.");
 
       const now = Date.now();
       try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: now, stocks: merged })); } catch {}
