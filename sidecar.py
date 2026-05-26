@@ -315,19 +315,28 @@ def _background_refresh_loop():
 
 
 def _pick_next_to_refresh() -> tuple[str, str] | None:
-    """Returns (ticker, kind) where kind is 'stock' or 'history'.
-    Priority: (1) stock-missing > (2) history-missing > (3) stale stock."""
+    """Returns (ticker, kind). If stocks are already 90%+ cached, prioritize
+    filling history so we don't get stuck retrying a single failing ticker."""
     universe = get_universe()
+
     with _cache_lock:
         stock_missing = [t for t in universe if t not in _cache]
-    if stock_missing:
-        return (stock_missing[0], "stock")
-
+        cache_size = len(_cache)
     with _history_lock:
         hist_missing = [t for t in universe if t not in _history]
+
+    cache_ratio = cache_size / len(universe) if universe else 0
+
+    # If we're 90%+ cached for stocks, prefer history work (avoids spinning
+    # on the 1-2 problematic tickers that always fail).
+    if cache_ratio >= 0.9 and hist_missing:
+        return (hist_missing[0], "history")
+    if stock_missing:
+        return (stock_missing[0], "stock")
     if hist_missing:
         return (hist_missing[0], "history")
 
+    # Everything cached → refresh staleest
     with _cache_lock:
         if not _cache:
             return None
