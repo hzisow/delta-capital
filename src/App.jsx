@@ -206,28 +206,51 @@ export default function DeltaCapital() {
     }
 
     try {
-      setMsg("Loading ticker universe…");
-      const uniRes = await fetch(`${API_BASE}/universe`);
-      if (!uniRes.ok) throw new Error("Failed to load universe");
-      const { tickers: universe } = await uniRes.json();
-
       setPhase("enriching");
-      setMsg(`Loading fundamentals for ${universe.length} US stocks (this takes ~30s)…`);
-      setProgress(0);
+      setMsg("Loading market data…");
+      setProgress(10);
 
-      let done = 0;
-      const rows = await batchFetch(universe, async (ticker) => {
-        try {
-          const row = await fetchStock(ticker, { fresh: forceRefresh });
-          tick(1);
-          setProgress(Math.round(++done / universe.length * 100));
-          return row;
-        } catch {
-          tick(1);
-          setProgress(Math.round(++done / universe.length * 100));
-          return null;
-        }
-      }, 8);
+      // If user hit Refresh, request the sidecar mark stale entries for priority
+      // refresh. The first response is still instant (from cache); we then poll
+      // every 5s to pull updated prices as the background worker catches them.
+      const bulkUrl = forceRefresh
+        ? `${API_BASE}/stocks/bulk?force_refresh_age_s=60`
+        : `${API_BASE}/stocks/bulk`;
+
+      const bulkRes = await fetch(bulkUrl);
+      if (!bulkRes.ok) throw new Error(`Failed to load stocks (HTTP ${bulkRes.status})`);
+      const { stocks: rows, universe, cached_count, universe_count } = await bulkRes.json();
+      tick(1);
+
+      setProgress(80);
+      setMsg(`${cached_count}/${universe_count} stocks loaded`);
+
+      // If we asked for a refresh, kick off a background poll that pulls updated
+      // data every 8 seconds until everything is < 60s old (or we hit 8 polls).
+      if (forceRefresh) {
+        let polls = 0;
+        const poll = async () => {
+          if (polls++ >= 8) return;
+          try {
+            const r = await fetch(`${API_BASE}/stocks/bulk`);
+            if (!r.ok) return;
+            const { stocks: fresh } = await r.json();
+            const merged = fresh
+              .filter(s => s && s.price > 0 && s.marketCap > 0)
+              .sort((a, b) => b.marketCap - a.marketCap);
+            setStocks(merged);
+            setScored(scoreAll(merged));
+            const now = Date.now();
+            try { localStorage.setItem(CACHE_KEY, JSON.stringify({ ts: now, stocks: merged })); } catch {}
+            setLastUpdated(now);
+            tick(1);
+            // Stop polling if everything is fresh
+            const stillStale = fresh.filter(s => (s._cacheAgeS ?? 0) > 60).length;
+            if (stillStale > 0) setTimeout(poll, 8000);
+          } catch {}
+        };
+        setTimeout(poll, 8000);
+      }
 
       const merged = rows
         .filter(s => s && s.price > 0 && s.marketCap > 0)

@@ -42,8 +42,15 @@ app.add_middleware(
 # ── Config ──────────────────────────────────────────────────────────────────
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "stock_cache.json")
 CACHE_TTL_SECONDS = 6 * 60 * 60       # refresh anything older than 6h
-THROTTLE_INTERVAL = 1.5                # ≥1.5s between outbound Yahoo calls
+THROTTLE_INTERVAL_MIN = 0.5            # aggressive — full universe in ~7 min
+THROTTLE_INTERVAL_MAX = 3.0            # backed off when Yahoo 429s
 WARMUP_DELAY_SECONDS = 15              # let server settle before warmup starts
+
+# Adaptive throttle: starts at MIN, bumps up on consecutive 429s, decays back.
+# This lets us push fast normally but back off automatically if Yahoo starts
+# pushing back.
+_throttle_interval = THROTTLE_INTERVAL_MIN
+_consecutive_429s = 0
 
 # ── State ───────────────────────────────────────────────────────────────────
 # disk cache: { ticker: { data: {...}, ts: epoch_seconds } }
@@ -88,10 +95,27 @@ def save_cache():
 def _wait_throttle():
     global _last_call_ts
     with _throttle_lock:
-        wait = THROTTLE_INTERVAL - (time.time() - _last_call_ts)
+        wait = _throttle_interval - (time.time() - _last_call_ts)
         if wait > 0:
             time.sleep(wait)
         _last_call_ts = time.time()
+
+
+def _record_response(was_429: bool):
+    """Adaptive throttle: speed up on success, back off on 429s."""
+    global _throttle_interval, _consecutive_429s
+    with _throttle_lock:
+        if was_429:
+            _consecutive_429s += 1
+            if _consecutive_429s >= 3:
+                _throttle_interval = min(THROTTLE_INTERVAL_MAX, _throttle_interval * 1.5)
+                print(f"[throttle] backing off to {_throttle_interval:.2f}s "
+                      f"after {_consecutive_429s} 429s")
+        else:
+            _consecutive_429s = 0
+            # Slowly decay back toward MIN on sustained success
+            if _throttle_interval > THROTTLE_INTERVAL_MIN:
+                _throttle_interval = max(THROTTLE_INTERVAL_MIN, _throttle_interval * 0.95)
 
 
 def trailing_return(closes: list[float], n: int) -> float | None:
@@ -146,7 +170,7 @@ def _fetch_from_yahoo(ticker: str) -> dict | None:
         price_to_book = safe(info.get("priceToBook"))
         debt_to_eq   = safe(info.get("debtToEquity"))
 
-        return {
+        result = {
             "ticker": ticker.upper(),
             "name": name,
             "sector": sector,
@@ -170,10 +194,13 @@ def _fetch_from_yahoo(ticker: str) -> dict | None:
             "analystCount": safe(info.get("numberOfAnalystOpinions")),
             "recommendation": info.get("recommendationKey"),
         }
+        _record_response(was_429=False)
+        return result
     except Exception as e:
-        # Only print the first ~80 chars of the error to keep logs readable
-        msg = str(e)[:80]
-        print(f"[fetch] {ticker}: {msg}")
+        msg = str(e)[:200]
+        is_429 = ("429" in msg or "Too Many" in msg or "Rate" in msg or "Invalid Crumb" in msg)
+        _record_response(was_429=is_429)
+        print(f"[fetch] {ticker}: {msg[:80]}")
         return None
 
 
@@ -344,6 +371,43 @@ def universe() -> dict:
     return {"tickers": tickers, "count": len(tickers)}
 
 
+@app.get("/stocks/bulk")
+def stocks_bulk(force_refresh_age_s: int | None = None) -> dict:
+    """Return every cached stock in one shot.
+
+    Args:
+        force_refresh_age_s: If set, any cached entry older than this gets
+            marked for priority refresh by the background worker before we
+            return. The response is still served from cache instantly — the
+            client polls again to see updated values.
+    """
+    now = time.time()
+    if force_refresh_age_s is not None:
+        # Mark old entries by setting their ts to 0 (staleest) so the
+        # background worker picks them up first
+        with _cache_lock:
+            for ticker, entry in _cache.items():
+                if now - entry["ts"] > force_refresh_age_s:
+                    entry["ts"] = 0
+
+    out = []
+    with _cache_lock:
+        for ticker, entry in _cache.items():
+            out.append({
+                **entry["data"],
+                "_cacheAgeS": int(now - entry["ts"]) if entry["ts"] > 0 else -1,
+                "_cacheStale": (now - entry["ts"]) > CACHE_TTL_SECONDS if entry["ts"] > 0 else True,
+            })
+    universe_list = get_universe()
+    return {
+        "stocks": out,
+        "universe": universe_list,
+        "cached_count": len(out),
+        "universe_count": len(universe_list),
+        "throttle_s": round(_throttle_interval, 2),
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     with _cache_lock:
@@ -361,7 +425,9 @@ def health() -> dict:
         "universe_size": len(get_universe()),
         "avg_age_minutes": round(avg_age_min, 1),
         "stale_count": stale_count,
-        "throttle_interval_s": THROTTLE_INTERVAL,
+        "throttle_interval_s": round(_throttle_interval, 2),
+        "throttle_min_s": THROTTLE_INTERVAL_MIN,
+        "consecutive_429s": _consecutive_429s,
     }
 
 
