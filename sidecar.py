@@ -323,7 +323,11 @@ def get_universe() -> list[str]:
     if _universe_cache:
         return _universe_cache
     fetched = _fetch_universe()
-    _universe_cache = fetched or _FALLBACK_UNIVERSE
+    base = fetched or _FALLBACK_UNIVERSE
+    # Ensure SPY is always present — it's used as the backtest benchmark
+    if "SPY" not in base:
+        base = base + ["SPY"]
+    _universe_cache = base
     print(f"[universe] loaded {len(_universe_cache)} tickers")
     return _universe_cache
 

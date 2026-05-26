@@ -400,7 +400,7 @@ export default function DeltaCapital() {
 
         {/* Tab nav */}
         <div style={{ display: "flex", gap: 4 }}>
-          {[["screen", "Screen"], ["picks", "Picks"]].map(([k, label]) => (
+          {[["screen", "Screen"], ["picks", "Picks"], ["backtest", "Backtest"]].map(([k, label]) => (
             <button
               key={k}
               onClick={() => setView(k)}
@@ -808,6 +808,11 @@ export default function DeltaCapital() {
         {view === "picks" && (
           <PicksView portfolio={portfolio} display={display} weights={weights} topN={topN} C={C} mono={mono} />
         )}
+
+        {/* ── BACKTEST VIEW ── */}
+        {view === "backtest" && (
+          <BacktestView portfolio={portfolio} scored={scored} topN={topN} C={C} mono={mono} />
+        )}
       </div>
 
       {/* ── HELP MODAL ── */}
@@ -883,6 +888,15 @@ export default function DeltaCapital() {
               <HelpItem term="1D / 1M / 3M / 1Y" def="Total price change over each window (1 day, 1 month, 3 months, 1 year). Green = positive, red = negative." />
             </HelpSection>
 
+            {/* Section: backtest */}
+            <HelpSection title="Backtest Tab">
+              <HelpItem term="What it does" def={`Simulates "if I had bought today's picks N months ago, equal-weighted, how would I have done?" Compares to SPY (S&P 500 ETF) at 1M, 3M, and 1Y horizons.`} />
+              <HelpItem term="Alpha" def="Portfolio return minus SPY return. Positive alpha = the picks beat the index. Negative = they underperformed." />
+              <HelpItem term="Hit rate" def="What % of the picks individually beat SPY over the same period. High alpha with low hit rate = a few big winners dragging the average up. High alpha + high hit rate = broad outperformance, more reliable signal." />
+              <HelpItem term="Look-ahead bias" def={`The simulation uses TODAY's fundamentals to score historical buys — we don't have point-in-time fundamentals (that's paid data). So this overstates the model's real-world performance. Use it as directional signal, not a profit forecast.`} />
+              <HelpItem term="Survivorship bias" def={`The universe (S&P 500 + S&P 400) only includes companies that exist today. Failed companies aren't there. Real backtest results would be a few % lower.`} />
+            </HelpSection>
+
             {/* Section: holding periods */}
             <HelpSection title="Suggested Holding Period (Picks tab)">
               <HelpItem term="How it's derived" def="Each stock's composite score is mostly driven by one of the four factors. We compute factor_score × factor_weight for each, take the dominant one, and assign that factor's empirical decay horizon." />
@@ -930,6 +944,261 @@ function HelpItem({ term, def }) {
     <div style={{ display: "grid", gridTemplateColumns: "160px 1fr", gap: 16, padding: "8px 0", borderBottom: "1px solid #2E2E2E" }}>
       <div style={{ fontSize: 12, color: "#FFFFFF", fontWeight: 600, letterSpacing: "0.02em" }}>{term}</div>
       <div style={{ fontSize: 12, color: "#B0B0B0", lineHeight: 1.6 }}>{def}</div>
+    </div>
+  );
+}
+
+// ── Backtest view ──────────────────────────────────────────────────────────
+// Simulates "what if I'd bought today's picks N months ago, equal-weight?"
+// Compares to SPY (S&P 500 ETF) at 1M / 3M / 1Y horizons. Honest about
+// the look-ahead-bias caveat — uses current fundamentals to score historical buys.
+function BacktestView({ portfolio, scored, topN, C, mono }) {
+  const spy = scored.find(s => s.ticker === "SPY");
+
+  if (!portfolio.length) {
+    return (
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontSize: 13 }}>
+        Loading data — the Backtest tab will populate once stocks finish enriching.
+      </div>
+    );
+  }
+
+  const HORIZONS = [
+    { key: "ret1M", label: "1 Month",   shortLabel: "1M",  desc: "Last 21 trading days" },
+    { key: "ret3M", label: "3 Months",  shortLabel: "3M",  desc: "Last 63 trading days" },
+    { key: "ret1Y", label: "1 Year",    shortLabel: "1Y",  desc: "Last 252 trading days" },
+  ];
+
+  const mean = (arr) => {
+    const vals = arr.filter(x => x != null && isFinite(x));
+    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+  };
+
+  const std = (arr) => {
+    const vals = arr.filter(x => x != null && isFinite(x));
+    if (vals.length < 2) return null;
+    const m = vals.reduce((a, b) => a + b, 0) / vals.length;
+    const v = vals.reduce((a, b) => a + (b - m) ** 2, 0) / (vals.length - 1);
+    return Math.sqrt(v);
+  };
+
+  const horizonStats = HORIZONS.map(h => {
+    const portRets = portfolio.map(s => s[h.key]);
+    const portRet = mean(portRets);
+    const portStd = std(portRets);
+    const spyRet = spy?.[h.key] ?? null;
+    const alpha = (portRet != null && spyRet != null) ? portRet - spyRet : null;
+    const beatCount = spyRet != null
+      ? portRets.filter(r => r != null && r > spyRet).length : 0;
+    const hitRate = portfolio.length ? (beatCount / portfolio.length) * 100 : 0;
+    return { ...h, portRet, portStd, spyRet, alpha, hitRate, beatCount };
+  });
+
+  // Per-stock 1Y contribution for the detail table
+  const equalWeight = 1 / portfolio.length;
+  const detailed = portfolio
+    .map(s => ({
+      ...s,
+      contrib1Y: (s.ret1Y ?? 0) * equalWeight,
+      vsSpy1Y: (s.ret1Y ?? 0) - (spy?.ret1Y ?? 0),
+    }))
+    .sort((a, b) => (b.ret1Y ?? -Infinity) - (a.ret1Y ?? -Infinity));
+
+  const totalContrib = detailed.reduce((sum, s) => sum + s.contrib1Y, 0);
+  const winners = detailed.filter(s => s.vsSpy1Y > 0).length;
+  const losers = detailed.length - winners;
+
+  // Bar chart helpers
+  const maxAbsAcrossHorizons = Math.max(
+    ...horizonStats.flatMap(h => [Math.abs(h.portRet ?? 0), Math.abs(h.spyRet ?? 0)]),
+    1
+  );
+
+  const fmtRet = (v) => v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+  const retColor = (v) => v == null ? C.muted : v >= 0 ? C.gain : C.loss;
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: "28px 40px", background: C.bg }}>
+      <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+
+        {/* Header */}
+        <div style={{ marginBottom: 28, paddingBottom: 18, borderBottom: `1px solid ${C.border2}` }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.28em", color: C.muted, textTransform: "uppercase", marginBottom: 8 }}>
+            Look-back Simulation
+          </div>
+          <div style={{ fontSize: 24, fontWeight: 600, color: C.text, letterSpacing: "0.01em", marginBottom: 8 }}>
+            Portfolio vs S&P 500
+          </div>
+          <div style={{ fontSize: 12, color: C.sub, lineHeight: 1.6, maxWidth: 760 }}>
+            "If I'd bought today's {portfolio.length} picks equal-weighted N months ago, how would I have done vs holding SPY?" Useful directional signal — see <strong style={{ color: C.text }}>caveats</strong> at bottom.
+          </div>
+        </div>
+
+        {/* Horizon comparison bars */}
+        <div style={{ marginBottom: 36 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 14, fontWeight: 600 }}>
+            Return by Horizon (Equal-Weight)
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 18 }}>
+            {horizonStats.map(h => (
+              <div key={h.key} style={{ background: C.surf, border: `1px solid ${C.border}`, padding: "20px 22px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
+                  <span style={{ fontSize: 11, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase" }}>
+                    {h.label}
+                  </span>
+                  <span style={{ fontSize: 9, color: C.muted }}>{h.desc}</span>
+                </div>
+
+                {/* Portfolio bar */}
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span style={{ fontSize: 11, color: C.text }}>Portfolio</span>
+                    <span style={{ fontSize: 14, color: retColor(h.portRet), fontFamily: mono, fontWeight: 600 }}>
+                      {fmtRet(h.portRet)}
+                    </span>
+                  </div>
+                  <div style={{ height: 3, background: C.border2, position: "relative" }}>
+                    <div style={{
+                      position: "absolute",
+                      left: h.portRet < 0 ? `${50 - Math.min(50, Math.abs(h.portRet) / maxAbsAcrossHorizons * 50)}%` : "50%",
+                      width: `${Math.min(50, Math.abs(h.portRet ?? 0) / maxAbsAcrossHorizons * 50)}%`,
+                      height: "100%",
+                      background: retColor(h.portRet),
+                      transition: "all 0.3s",
+                    }} />
+                    <div style={{ position: "absolute", left: "50%", top: -2, width: 1, height: 7, background: C.border2 }} />
+                  </div>
+                </div>
+
+                {/* SPY bar */}
+                <div style={{ marginBottom: 16 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+                    <span style={{ fontSize: 11, color: C.muted }}>S&P 500 (SPY)</span>
+                    <span style={{ fontSize: 13, color: C.sub, fontFamily: mono }}>
+                      {fmtRet(h.spyRet)}
+                    </span>
+                  </div>
+                  <div style={{ height: 3, background: C.border2, position: "relative" }}>
+                    <div style={{
+                      position: "absolute",
+                      left: h.spyRet < 0 ? `${50 - Math.min(50, Math.abs(h.spyRet) / maxAbsAcrossHorizons * 50)}%` : "50%",
+                      width: `${Math.min(50, Math.abs(h.spyRet ?? 0) / maxAbsAcrossHorizons * 50)}%`,
+                      height: "100%",
+                      background: C.muted,
+                    }} />
+                  </div>
+                </div>
+
+                {/* Alpha + hit rate */}
+                <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 12, display: "flex", justifyContent: "space-between" }}>
+                  <div>
+                    <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 3 }}>
+                      Alpha
+                    </div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: retColor(h.alpha), fontFamily: mono }}>
+                      {fmtRet(h.alpha)}
+                    </div>
+                  </div>
+                  <div style={{ textAlign: "right" }}>
+                    <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 3 }}>
+                      Hit rate
+                    </div>
+                    <div style={{ fontSize: 16, fontWeight: 600, color: h.hitRate >= 50 ? C.gain : C.loss, fontFamily: mono }}>
+                      {h.hitRate.toFixed(0)}%
+                    </div>
+                    <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>
+                      {h.beatCount}/{portfolio.length} beat SPY
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Summary card */}
+        <div style={{ marginBottom: 36, background: C.surf, border: `1px solid ${C.border2}`, padding: "22px 26px" }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 14, fontWeight: 600 }}>
+            1-Year Summary
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
+            {[
+              ["Total return", fmtRet(totalContrib), retColor(totalContrib)],
+              ["vs SPY (alpha)", fmtRet(horizonStats[2].alpha), retColor(horizonStats[2].alpha)],
+              ["Winners", `${winners}/${portfolio.length}`, winners > losers ? C.gain : C.text],
+              ["Losers", `${losers}/${portfolio.length}`, losers > winners ? C.loss : C.muted],
+            ].map(([lbl, val, color]) => (
+              <div key={lbl}>
+                <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.12em", marginBottom: 6 }}>
+                  {lbl}
+                </div>
+                <div style={{ fontSize: 22, fontWeight: 600, color, fontFamily: mono }}>
+                  {val}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Per-stock contribution */}
+        <div style={{ marginBottom: 36 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 14, fontWeight: 600 }}>
+            Per-Stock 1Y Contribution (sorted best → worst)
+          </div>
+          <div style={{ border: `1px solid ${C.border}` }}>
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: "90px 1fr 130px 90px 90px 90px",
+              gap: 16, padding: "10px 16px", background: C.surf,
+              fontSize: 9, color: C.muted, letterSpacing: "0.14em",
+              textTransform: "uppercase", borderBottom: `1px solid ${C.border2}`,
+            }}>
+              <div>Ticker</div>
+              <div>Name</div>
+              <div>Sector</div>
+              <div style={{ textAlign: "right" }}>1Y Return</div>
+              <div style={{ textAlign: "right" }}>vs SPY</div>
+              <div style={{ textAlign: "right" }}>Contrib</div>
+            </div>
+            {detailed.map(s => (
+              <div key={s.ticker} style={{
+                display: "grid",
+                gridTemplateColumns: "90px 1fr 130px 90px 90px 90px",
+                gap: 16, padding: "10px 16px",
+                borderBottom: `1px solid ${C.border}`,
+                alignItems: "center",
+              }}>
+                <div style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, color: C.text }}>{s.ticker}</div>
+                <div style={{ fontSize: 11, color: C.sub, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
+                  {s.name}
+                </div>
+                <div style={{ fontSize: 10, color: C.muted, whiteSpace: "nowrap" }}>{s.sector}</div>
+                <div style={{ textAlign: "right", fontFamily: mono, fontSize: 12, color: retColor(s.ret1Y) }}>
+                  {fmtRet(s.ret1Y)}
+                </div>
+                <div style={{ textAlign: "right", fontFamily: mono, fontSize: 12, color: retColor(s.vsSpy1Y) }}>
+                  {fmtRet(s.vsSpy1Y)}
+                </div>
+                <div style={{ textAlign: "right", fontFamily: mono, fontSize: 12, color: C.text }}>
+                  {fmtRet(s.contrib1Y)}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Caveats */}
+        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.7, paddingTop: 16, borderTop: `1px solid ${C.border}` }}>
+          <div style={{ color: C.sub, marginBottom: 8, fontWeight: 600 }}>Honest caveats — read these:</div>
+          <ul style={{ paddingLeft: 18, margin: 0 }}>
+            <li><strong>Look-ahead bias</strong>: picks are scored with TODAY's fundamentals, then "purchased" historically. A true institutional backtest would use point-in-time fundamentals (paid data we don't have).</li>
+            <li><strong>Survivorship bias</strong>: universe is current S&P 500 + S&P 400. Companies that got delisted or merged aren't here — so the universe is biased toward survivors.</li>
+            <li><strong>No transaction costs / taxes</strong>: real returns would be lower after slippage, commissions, and capital-gains tax.</li>
+            <li><strong>No rebalancing</strong>: the model picks once and holds. A real factor strategy rebalances monthly or quarterly.</li>
+            <li><strong>Use as a directional signal</strong>: "the factor mix beat SPY by N% over the year" → factors are doing something. Not "I'll definitely make N% next year."</li>
+          </ul>
+        </div>
+      </div>
     </div>
   );
 }
