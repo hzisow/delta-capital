@@ -1,0 +1,8 @@
+# Don't ship the Python sidecar to Vercel — it runs separately (Render or local + Cloudflare Tunnel)
+requirements.txt
+sidecar.py
+sidecar-venv/
+render.yaml
+DEPLOY.md
+__pycache__/
+*.pyc
