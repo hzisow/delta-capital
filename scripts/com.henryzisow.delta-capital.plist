@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Unique identifier for this user agent -->
+  <key>Label</key>
+  <string>com.henryzisow.delta-capital</string>
+
+  <!-- The actual script that boots sidecar + tailscale funnel -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/henryzisow/Desktop/delta-capital/scripts/start-delta.sh</string>
+  </array>
+
+  <!-- Start at login -->
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- If the script exits for any reason, relaunch it (with a 10s cool-down) -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <!-- Working directory -->
+  <key>WorkingDirectory</key>
+  <string>/Users/henryzisow/Desktop/delta-capital</string>
+
+  <!-- Capture stdout/stderr to log files for debugging -->
+  <key>StandardOutPath</key>
+  <string>/Users/henryzisow/Desktop/delta-capital/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/henryzisow/Desktop/delta-capital/logs/launchd.err.log</string>
+
+  <!-- Make sure PATH includes homebrew binaries -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>/Users/henryzisow</string>
+  </dict>
+</dict>
+</plist>
