@@ -973,38 +973,63 @@ function HelpItem({ term, def }) {
 //   4. Compare to SPY's same-month return
 // Quality/Value factors aren't included because we don't have historical
 // fundamentals (paid data we don't have access to).
-function runWalkForward(history, weights, N) {
+function runWalkForward(history, params) {
+  const {
+    momLookback = 12,       // months for momentum window (e.g. 12-1 = 12)
+    minMomentum = null,     // absolute momentum filter: skip stocks below this return
+    topN = 20,              // portfolio size
+    momWeight = 65,         // mom % weight in composite
+    volWeight = 35,         // vol % weight in composite
+    trendFilter = false,    // hold cash when SPY's own momLookback return is negative
+  } = params || {};
+
   const spy = history?.SPY;
-  if (!spy || spy.length < 14) return null;
+  if (!spy || spy.length < momLookback + 2) return null;
 
   const dates = spy.map(r => r[0]);
   const months = [];
+  const minStart = momLookback + 1;
 
-  for (let i = 13; i < dates.length - 1; i++) {
+  for (let i = minStart; i < dates.length - 1; i++) {
     const tDate = dates[i];
     const tNext = dates[i + 1];
+
+    // Trend filter on the broad market
+    const spyMomStart = spy[i - momLookback][1];
+    const spyMomEnd   = spy[i - 1][1];
+    const spyMom = spyMomEnd / spyMomStart - 1;
+    if (trendFilter && spyMom < 0) {
+      // "Cash" position: zero return, but still record SPY return for comparison
+      const spyRet = spy[i + 1][1] / spy[i][1] - 1;
+      months.push({ date: tNext, portRet: 0, spyRet, pickCount: 0, cash: true });
+      continue;
+    }
 
     const candidates = [];
     for (const ticker in history) {
       if (ticker === "SPY") continue;
       const rows = history[ticker];
       const idx = rows.findIndex(r => r[0] === tDate);
-      if (idx < 12) continue;
+      if (idx < momLookback) continue;
       const nextIdx = rows.findIndex(r => r[0] === tNext);
       if (nextIdx < 0) continue;
 
-      const price       = rows[idx][1];
-      const priceNext   = rows[nextIdx][1];
-      const price1mAgo  = rows[idx - 1][1];
-      const price12mAgo = rows[idx - 12][1];
-      if (!price || !priceNext || !price1mAgo || !price12mAgo) continue;
+      const price        = rows[idx][1];
+      const priceNext    = rows[nextIdx][1];
+      const price1mAgo   = rows[idx - 1][1];
+      const priceLookbackAgo = rows[idx - momLookback][1];
+      if (!price || !priceNext || !price1mAgo || !priceLookbackAgo) continue;
 
-      // 12-1 momentum: return from 12m ago to 1m ago (skipping the most recent month)
-      const mom = price1mAgo / price12mAgo - 1;
+      // (lookback-1) momentum: return from lookback months ago to 1m ago
+      const mom = price1mAgo / priceLookbackAgo - 1;
 
-      // Trailing 12-month monthly-return volatility (low vol factor)
+      // Skip stocks with negative absolute momentum if filter is on
+      if (minMomentum != null && mom < minMomentum) continue;
+
+      // Trailing-12-month monthly-return volatility (low vol factor)
       const rets = [];
-      for (let j = idx - 11; j <= idx; j++) {
+      const volWindow = Math.min(12, idx);
+      for (let j = idx - volWindow + 1; j <= idx; j++) {
         if (rows[j - 1] && rows[j]) rets.push(rows[j][1] / rows[j - 1][1] - 1);
       }
       if (rets.length < 6) continue;
@@ -1014,24 +1039,22 @@ function runWalkForward(history, weights, N) {
       candidates.push({ ticker, mom, vol, price, priceNext });
     }
 
-    if (candidates.length < N) continue;
+    if (candidates.length < topN) continue;
 
     // Percentile rank — higher mom = better, lower vol = better
     const byMom = [...candidates].sort((a, b) => a.mom - b.mom);
-    const byVol = [...candidates].sort((a, b) => b.vol - a.vol); // descending — index 0 = highest vol
+    const byVol = [...candidates].sort((a, b) => b.vol - a.vol);
     candidates.forEach(c => {
       c.momScore = byMom.indexOf(c) / (candidates.length - 1) * 100;
       c.volScore = byVol.indexOf(c) / (candidates.length - 1) * 100;
     });
 
-    // Composite using only Mom + LowVol weights (Q+V can't be backtested)
-    const wM = weights.mom, wV = weights.vol;
-    const totalW = wM + wV || 1;
+    const totalW = momWeight + volWeight || 1;
     candidates.forEach(c => {
-      c.composite = (c.momScore * wM + c.volScore * wV) / totalW;
+      c.composite = (c.momScore * momWeight + c.volScore * volWeight) / totalW;
     });
 
-    const picks = candidates.sort((a, b) => b.composite - a.composite).slice(0, N);
+    const picks = candidates.sort((a, b) => b.composite - a.composite).slice(0, topN);
     const portRet = picks.reduce((s, p) => s + (p.priceNext / p.price - 1), 0) / picks.length;
     const spyRet = spy[i + 1][1] / spy[i][1] - 1;
 
@@ -1089,7 +1112,27 @@ function computeStats(months) {
 }
 
 // ── Backtest view (walk-forward) ───────────────────────────────────────────
+// Strategy presets — each maps to a set of walk-forward params
+const STRATEGY_PRESETS = {
+  conservative: {
+    label: "Conservative",
+    blurb: "Low-vol heavy. Smoother ride, lower returns. Holds top 30 by 12-1 mom + vol mix.",
+    params: { momLookback: 12, minMomentum: null, topN: 30, momWeight: 35, volWeight: 65, trendFilter: false },
+  },
+  balanced: {
+    label: "Balanced",
+    blurb: "Default — mom + low-vol mix, top 20 stocks, monthly rebalance.",
+    params: { momLookback: 12, minMomentum: null, topN: 20, momWeight: 65, volWeight: 35, trendFilter: false },
+  },
+  aggressive: {
+    label: "Aggressive",
+    blurb: "Pure momentum, short lookback, concentrated top 10, absolute-momentum filter, market-regime gate.",
+    params: { momLookback: 6, minMomentum: 0, topN: 10, momWeight: 100, volWeight: 0, trendFilter: true },
+  },
+};
+
 function BacktestView({ portfolio, scored, topN, weights, history, C, mono }) {
+  const [preset, setPreset] = useState("aggressive");
   const hasHistory = history && history.SPY && Object.keys(history).length > 50;
 
   if (!hasHistory) {
@@ -1110,10 +1153,11 @@ function BacktestView({ portfolio, scored, topN, weights, history, C, mono }) {
     );
   }
 
-  // Run the walk-forward backtest
+  // Run the walk-forward backtest using the selected preset's params
+  const presetConfig = STRATEGY_PRESETS[preset];
   const months = useMemo(
-    () => runWalkForward(history, weights, Math.max(10, topN)),
-    [history, weights.mom, weights.vol, topN]
+    () => runWalkForward(history, presetConfig.params),
+    [history, preset]
   );
   const stats = useMemo(() => computeStats(months), [months]);
 
@@ -1159,11 +1203,39 @@ function BacktestView({ portfolio, scored, topN, weights, history, C, mono }) {
             Walk-Forward Backtest · {stats.years.toFixed(1)} years · monthly rebalance
           </div>
           <div style={{ fontSize: 24, fontWeight: 600, color: C.text, letterSpacing: "0.01em", marginBottom: 8 }}>
-            Mom + LowVol Strategy vs S&P 500
+            {presetConfig.label} Strategy vs S&P 500
           </div>
-          <div style={{ fontSize: 12, color: C.sub, lineHeight: 1.6, maxWidth: 800 }}>
-            Point-in-time backtest. Each month uses ONLY data available at that date to score and pick the top {Math.max(10, topN)} stocks. No look-ahead bias.
-            Only Momentum and Low-Vol factors are included — Quality and Value need historical fundamentals (paid data we don't have).
+          <div style={{ fontSize: 12, color: C.sub, lineHeight: 1.6, maxWidth: 800, marginBottom: 14 }}>
+            Point-in-time backtest, no look-ahead bias. Pick a preset to switch strategies — they re-run instantly.
+          </div>
+
+          {/* Preset selector */}
+          <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
+            {Object.entries(STRATEGY_PRESETS).map(([k, cfg]) => (
+              <button
+                key={k}
+                onClick={() => setPreset(k)}
+                style={{
+                  padding: "8px 18px", fontSize: 11, letterSpacing: "0.12em",
+                  textTransform: "uppercase", cursor: "pointer", fontWeight: 600,
+                  background: preset === k ? C.text : "transparent",
+                  color: preset === k ? C.bg : C.muted,
+                  border: `1px solid ${preset === k ? C.text : C.border2}`,
+                  fontFamily: "'Barlow', sans-serif", transition: "all 0.15s",
+                }}
+              >
+                {cfg.label}
+              </button>
+            ))}
+          </div>
+
+          <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.6 }}>
+            <strong style={{ color: C.sub }}>{presetConfig.label}:</strong> {presetConfig.blurb}
+            <div style={{ marginTop: 6, fontFamily: mono, fontSize: 10, color: "#7A7A7A" }}>
+              lookback={presetConfig.params.momLookback}mo · min-mom={presetConfig.params.minMomentum ?? "none"} ·
+              top-{presetConfig.params.topN} · mom-weight={presetConfig.params.momWeight}% ·
+              vol-weight={presetConfig.params.volWeight}% · trend-filter={presetConfig.params.trendFilter ? "ON" : "OFF"}
+            </div>
           </div>
         </div>
 
