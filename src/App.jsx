@@ -101,6 +101,29 @@ const fmtCap = n => {
   return `$${(n / 1e6).toFixed(0)}M`;
 };
 const fmtPct = (v, dec = 1) => v != null ? `${v >= 0 ? "+" : ""}${v.toFixed(dec)}%` : "—";
+// Suggested holding period derived from which factor dominates the stock's
+// composite score (under the user's current weights). Each factor has a
+// different empirical decay horizon — momentum reverses in months, quality
+// compounds for years.
+const HORIZONS = {
+  mom:  { label: "3–6 months",  short: "3–6mo",  reason: "Momentum signals decay over 3–6 months as the trade gets crowded — trim before reversal." },
+  qual: { label: "1–3 years",   short: "1–3yr",  reason: "Quality compounders reward patience. High-ROE, low-debt, cash-generative businesses are long-term holds." },
+  val:  { label: "12–18 months", short: "12–18mo", reason: "Value takes time to be recognized. Mean reversion is slow — give the market a year to close the gap." },
+  vol:  { label: "6–12 months", short: "6–12mo", reason: "The low-volatility anomaly is a slow-moving factor that rewards exposure across a market cycle." },
+};
+
+const suggestedHorizon = (s, w) => {
+  const total = w.mom + w.qual + w.val + w.vol || 1;
+  const contribs = {
+    mom:  (s.momentumScore ?? 0) * w.mom  / total,
+    qual: (s.qualityScore  ?? 0) * w.qual / total,
+    val:  (s.valueScore    ?? 0) * w.val  / total,
+    vol:  (s.lowVolScore   ?? 0) * w.vol  / total,
+  };
+  const dominant = Object.entries(contribs).sort((a, b) => b[1] - a[1])[0][0];
+  return HORIZONS[dominant];
+};
+
 const fmtAgo = (ts) => {
   if (!ts) return "—";
   const s = Math.round((Date.now() - ts) / 1000);
@@ -837,6 +860,16 @@ export default function DeltaCapital() {
               <HelpItem term="1D / 1M / 3M / 1Y" def="Total price change over each window (1 day, 1 month, 3 months, 1 year). Green = positive, red = negative." />
             </HelpSection>
 
+            {/* Section: holding periods */}
+            <HelpSection title="Suggested Holding Period (Picks tab)">
+              <HelpItem term="How it's derived" def="Each stock's composite score is mostly driven by one of the four factors. We compute factor_score × factor_weight for each, take the dominant one, and assign that factor's empirical decay horizon." />
+              <HelpItem term="Momentum-driven (3–6mo)" def="12-1 momentum signals decay in 3–6 months as the trade gets crowded and reverses (Jegadeesh & Titman, 1993). Trim before the reversal." />
+              <HelpItem term="Value-driven (12–18mo)" def="Cheap stocks take time to be recognized. Mean reversion in P/E and P/B works on a 1-year+ horizon." />
+              <HelpItem term="Quality-driven (1–3 years)" def="High-ROE, low-debt, cash-generative compounders reward patience. Buffett-style buy-and-hold." />
+              <HelpItem term="Low-Vol driven (6–12mo)" def="The low-volatility anomaly is a slow-moving factor; defensive positioning rewards a full market cycle of exposure." />
+              <HelpItem term="Heads up" def="Reassess if a stock's dominant factor flips, you hit your target price, or the thesis breaks. For comparison, AQR-style factor funds rebalance monthly — these are honest minimums, not maximums." />
+            </HelpSection>
+
             {/* Section: controls */}
             <HelpSection title="Controls">
               <HelpItem term="Factor Weights" def="Sliders that set how much each factor contributes to the composite score. They're auto-normalized — only the ratios matter, not the absolute numbers." />
@@ -848,7 +881,7 @@ export default function DeltaCapital() {
 
             {/* Footer note */}
             <div style={{ marginTop: 24, paddingTop: 18, borderTop: `1px solid ${C.border2}`, fontSize: 11, color: C.muted, lineHeight: 1.7 }}>
-              Data via Financial Modeling Prep. Universe is a curated set of large-cap US stocks. Scores are recomputed locally — slide the weights to backtest different factor tilts. Not investment advice.
+              Data via Yahoo Finance (15-min delayed during market hours). Universe = S&P 500 + S&P MidCap 400 (~900 stocks). Scores are recomputed locally — slide the weights to backtest different factor tilts. Not investment advice.
             </div>
           </div>
         </div>
@@ -1003,7 +1036,7 @@ function PicksView({ portfolio, display, weights, topN, C, mono }) {
             {/* Header */}
             <div style={{
               display: "grid",
-              gridTemplateColumns: "40px 90px 1fr 130px 80px 100px 80px 90px",
+              gridTemplateColumns: "40px 90px 1fr 130px 80px 100px 80px 90px 90px",
               gap: 16, padding: "10px 16px", background: C.surf,
               fontSize: 9, color: C.muted, letterSpacing: "0.14em",
               textTransform: "uppercase", borderBottom: `1px solid ${C.border2}`,
@@ -1016,6 +1049,7 @@ function PicksView({ portfolio, display, weights, topN, C, mono }) {
               <div style={{ textAlign: "right" }}>Price → Target</div>
               <div style={{ textAlign: "right" }}>Upside</div>
               <div style={{ textAlign: "right" }}>Weight</div>
+              <div style={{ textAlign: "right" }}>Hold</div>
             </div>
             {/* Rows */}
             {picksRanked.map((s, i) => {
@@ -1024,7 +1058,7 @@ function PicksView({ portfolio, display, weights, topN, C, mono }) {
               return (
                 <div key={s.ticker} style={{
                   display: "grid",
-                  gridTemplateColumns: "40px 90px 1fr 130px 80px 100px 80px 90px",
+                  gridTemplateColumns: "40px 90px 1fr 130px 80px 100px 80px 90px 90px",
                   gap: 16, padding: "12px 16px",
                   borderBottom: `1px solid ${C.border}`,
                   alignItems: "center",
@@ -1063,6 +1097,12 @@ function PicksView({ portfolio, display, weights, topN, C, mono }) {
                   </div>
                   <div style={{ textAlign: "right", fontFamily: mono, fontSize: 12, color: C.text }}>
                     {equalWeight.toFixed(1)}%
+                  </div>
+                  <div
+                    title={suggestedHorizon(s, weights).reason}
+                    style={{ textAlign: "right", fontSize: 11, color: C.sub, cursor: "help" }}
+                  >
+                    {suggestedHorizon(s, weights).short}
                   </div>
                 </div>
               );

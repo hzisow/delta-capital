@@ -28,6 +28,8 @@ sidecar-venv/
 __pycache__/
 *.pyc
 .env
+stock_cache.json
+stock_cache.json.tmp
 
 # Claude harness
 .claude/
