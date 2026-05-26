@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 
 // ── Config ─────────────────────────────────────────────────────────────────
 const CACHE_KEY = "delta-capital-cache-v4";
@@ -180,7 +180,8 @@ export default function DeltaCapital() {
   const [aiLoading, setAiLoading] = useState(null);
   const [showHelp, setShowHelp]   = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
-  const [view, setView]           = useState("screen"); // "screen" | "picks"
+  const [view, setView]           = useState("screen"); // "screen" | "picks" | "backtest"
+  const [history, setHistory]     = useState({});
 
   const tick = (n = 1) => { callsRef.current += n; setCalls(callsRef.current); };
 
@@ -217,9 +218,20 @@ export default function DeltaCapital() {
         ? `${API_BASE}/stocks/bulk?force_refresh_age_s=60`
         : `${API_BASE}/stocks/bulk`;
 
-      const bulkRes = await fetch(bulkUrl);
+      // Fetch fundamentals + historical monthly closes in parallel
+      const [bulkRes, histRes] = await Promise.all([
+        fetch(bulkUrl),
+        fetch(`${API_BASE}/historical/bulk`).catch(() => null),
+      ]);
       if (!bulkRes.ok) throw new Error(`Failed to load stocks (HTTP ${bulkRes.status})`);
       const { stocks: rows, universe, cached_count, universe_count } = await bulkRes.json();
+
+      if (histRes && histRes.ok) {
+        try {
+          const histJson = await histRes.json();
+          setHistory(histJson.history || {});
+        } catch {}
+      }
       tick(1);
 
       setProgress(80);
@@ -811,7 +823,11 @@ export default function DeltaCapital() {
 
         {/* ── BACKTEST VIEW ── */}
         {view === "backtest" && (
-          <BacktestView portfolio={portfolio} scored={scored} topN={topN} C={C} mono={mono} />
+          <BacktestView
+            portfolio={portfolio} scored={scored} topN={topN}
+            weights={weights} history={history}
+            C={C} mono={mono}
+          />
         )}
       </div>
 
@@ -948,254 +964,307 @@ function HelpItem({ term, def }) {
   );
 }
 
-// ── Backtest view ──────────────────────────────────────────────────────────
-// Simulates "what if I'd bought today's picks N months ago, equal-weight?"
-// Compares to SPY (S&P 500 ETF) at 1M / 3M / 1Y horizons. Honest about
-// the look-ahead-bias caveat — uses current fundamentals to score historical buys.
-function BacktestView({ portfolio, scored, topN, C, mono }) {
-  const spy = scored.find(s => s.ticker === "SPY");
+// ── Walk-forward backtest engine ────────────────────────────────────────────
+// True point-in-time backtest of the Mom + LowVol factors using only monthly
+// price data (no look-ahead). At each month t we:
+//   1. Score every ticker using ONLY data available through t
+//   2. Pick top N by (mom × wMom + vol × wVol)
+//   3. Hold for one month, record return
+//   4. Compare to SPY's same-month return
+// Quality/Value factors aren't included because we don't have historical
+// fundamentals (paid data we don't have access to).
+function runWalkForward(history, weights, N) {
+  const spy = history?.SPY;
+  if (!spy || spy.length < 14) return null;
 
-  if (!portfolio.length) {
+  const dates = spy.map(r => r[0]);
+  const months = [];
+
+  for (let i = 13; i < dates.length - 1; i++) {
+    const tDate = dates[i];
+    const tNext = dates[i + 1];
+
+    const candidates = [];
+    for (const ticker in history) {
+      if (ticker === "SPY") continue;
+      const rows = history[ticker];
+      const idx = rows.findIndex(r => r[0] === tDate);
+      if (idx < 12) continue;
+      const nextIdx = rows.findIndex(r => r[0] === tNext);
+      if (nextIdx < 0) continue;
+
+      const price       = rows[idx][1];
+      const priceNext   = rows[nextIdx][1];
+      const price1mAgo  = rows[idx - 1][1];
+      const price12mAgo = rows[idx - 12][1];
+      if (!price || !priceNext || !price1mAgo || !price12mAgo) continue;
+
+      // 12-1 momentum: return from 12m ago to 1m ago (skipping the most recent month)
+      const mom = price1mAgo / price12mAgo - 1;
+
+      // Trailing 12-month monthly-return volatility (low vol factor)
+      const rets = [];
+      for (let j = idx - 11; j <= idx; j++) {
+        if (rows[j - 1] && rows[j]) rets.push(rows[j][1] / rows[j - 1][1] - 1);
+      }
+      if (rets.length < 6) continue;
+      const meanR = rets.reduce((a, b) => a + b, 0) / rets.length;
+      const vol = Math.sqrt(rets.reduce((s, r) => s + (r - meanR) ** 2, 0) / (rets.length - 1));
+
+      candidates.push({ ticker, mom, vol, price, priceNext });
+    }
+
+    if (candidates.length < N) continue;
+
+    // Percentile rank — higher mom = better, lower vol = better
+    const byMom = [...candidates].sort((a, b) => a.mom - b.mom);
+    const byVol = [...candidates].sort((a, b) => b.vol - a.vol); // descending — index 0 = highest vol
+    candidates.forEach(c => {
+      c.momScore = byMom.indexOf(c) / (candidates.length - 1) * 100;
+      c.volScore = byVol.indexOf(c) / (candidates.length - 1) * 100;
+    });
+
+    // Composite using only Mom + LowVol weights (Q+V can't be backtested)
+    const wM = weights.mom, wV = weights.vol;
+    const totalW = wM + wV || 1;
+    candidates.forEach(c => {
+      c.composite = (c.momScore * wM + c.volScore * wV) / totalW;
+    });
+
+    const picks = candidates.sort((a, b) => b.composite - a.composite).slice(0, N);
+    const portRet = picks.reduce((s, p) => s + (p.priceNext / p.price - 1), 0) / picks.length;
+    const spyRet = spy[i + 1][1] / spy[i][1] - 1;
+
+    months.push({ date: tNext, portRet, spyRet, pickCount: picks.length });
+  }
+
+  return months;
+}
+
+function computeStats(months) {
+  if (!months || months.length === 0) return null;
+  const port = months.map(m => m.portRet);
+  const spy  = months.map(m => m.spyRet);
+
+  // Cumulative compounded returns
+  const cumProd = (rets) => rets.reduce((p, r) => p * (1 + r), 1);
+  const portCum = cumProd(port) - 1;
+  const spyCum  = cumProd(spy)  - 1;
+
+  const years = months.length / 12;
+  const portAnnual = Math.pow(1 + portCum, 1 / years) - 1;
+  const spyAnnual  = Math.pow(1 + spyCum,  1 / years) - 1;
+  const alphaAnnual = portAnnual - spyAnnual;
+
+  const mean = (a) => a.reduce((s, x) => s + x, 0) / a.length;
+  const std  = (a) => {
+    const m = mean(a);
+    return Math.sqrt(a.reduce((s, x) => s + (x - m) ** 2, 0) / (a.length - 1));
+  };
+  // Annualized Sharpe (no risk-free deduction; close enough for relative comparison)
+  const sharpePort = (mean(port) / std(port)) * Math.sqrt(12);
+  const sharpeSpy  = (mean(spy)  / std(spy))  * Math.sqrt(12);
+
+  // Max drawdown of the strategy
+  let peak = 1, cum = 1, maxDD = 0;
+  for (const r of port) {
+    cum *= (1 + r);
+    if (cum > peak) peak = cum;
+    const dd = (cum - peak) / peak;
+    if (dd < maxDD) maxDD = dd;
+  }
+
+  // Hit rate vs SPY (months strategy beat SPY)
+  const wins = months.filter(m => m.portRet > m.spyRet).length;
+
+  return {
+    monthCount: months.length,
+    years,
+    portCum, spyCum, alphaCum: portCum - spyCum,
+    portAnnual, spyAnnual, alphaAnnual,
+    sharpePort, sharpeSpy,
+    maxDD,
+    hitRate: wins / months.length,
+  };
+}
+
+// ── Backtest view (walk-forward) ───────────────────────────────────────────
+function BacktestView({ portfolio, scored, topN, weights, history, C, mono }) {
+  const hasHistory = history && history.SPY && Object.keys(history).length > 50;
+
+  if (!hasHistory) {
+    const tickerCount = Object.keys(history || {}).length;
     return (
-      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontSize: 13 }}>
-        Loading data — the Backtest tab will populate once stocks finish enriching.
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16, color: C.muted, fontSize: 13, padding: 40 }}>
+        <div style={{ fontSize: 11, letterSpacing: "0.2em", textTransform: "uppercase", color: C.sub }}>
+          Backtest data warming up
+        </div>
+        <div style={{ maxWidth: 480, textAlign: "center", lineHeight: 1.6 }}>
+          The sidecar is fetching 5 years of monthly price history for {portfolio.length ? "all" : "the"} stocks.
+          Currently have history for <span style={{ fontFamily: mono, color: C.text }}>{tickerCount}</span> tickers.
+          <br /><br />
+          At the current throttle (~0.5s per ticker), full warmup takes ~8 minutes. SPY needs to be cached before any results can compute.
+          Refresh this tab in a few minutes.
+        </div>
       </div>
     );
   }
 
-  const HORIZONS = [
-    { key: "ret1M", label: "1 Month",   shortLabel: "1M",  desc: "Last 21 trading days" },
-    { key: "ret3M", label: "3 Months",  shortLabel: "3M",  desc: "Last 63 trading days" },
-    { key: "ret1Y", label: "1 Year",    shortLabel: "1Y",  desc: "Last 252 trading days" },
-  ];
-
-  const mean = (arr) => {
-    const vals = arr.filter(x => x != null && isFinite(x));
-    return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
-  };
-
-  const std = (arr) => {
-    const vals = arr.filter(x => x != null && isFinite(x));
-    if (vals.length < 2) return null;
-    const m = vals.reduce((a, b) => a + b, 0) / vals.length;
-    const v = vals.reduce((a, b) => a + (b - m) ** 2, 0) / (vals.length - 1);
-    return Math.sqrt(v);
-  };
-
-  const horizonStats = HORIZONS.map(h => {
-    const portRets = portfolio.map(s => s[h.key]);
-    const portRet = mean(portRets);
-    const portStd = std(portRets);
-    const spyRet = spy?.[h.key] ?? null;
-    const alpha = (portRet != null && spyRet != null) ? portRet - spyRet : null;
-    const beatCount = spyRet != null
-      ? portRets.filter(r => r != null && r > spyRet).length : 0;
-    const hitRate = portfolio.length ? (beatCount / portfolio.length) * 100 : 0;
-    return { ...h, portRet, portStd, spyRet, alpha, hitRate, beatCount };
-  });
-
-  // Per-stock 1Y contribution for the detail table
-  const equalWeight = 1 / portfolio.length;
-  const detailed = portfolio
-    .map(s => ({
-      ...s,
-      contrib1Y: (s.ret1Y ?? 0) * equalWeight,
-      vsSpy1Y: (s.ret1Y ?? 0) - (spy?.ret1Y ?? 0),
-    }))
-    .sort((a, b) => (b.ret1Y ?? -Infinity) - (a.ret1Y ?? -Infinity));
-
-  const totalContrib = detailed.reduce((sum, s) => sum + s.contrib1Y, 0);
-  const winners = detailed.filter(s => s.vsSpy1Y > 0).length;
-  const losers = detailed.length - winners;
-
-  // Bar chart helpers
-  const maxAbsAcrossHorizons = Math.max(
-    ...horizonStats.flatMap(h => [Math.abs(h.portRet ?? 0), Math.abs(h.spyRet ?? 0)]),
-    1
+  // Run the walk-forward backtest
+  const months = useMemo(
+    () => runWalkForward(history, weights, Math.max(10, topN)),
+    [history, weights.mom, weights.vol, topN]
   );
+  const stats = useMemo(() => computeStats(months), [months]);
 
-  const fmtRet = (v) => v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+  if (!months || months.length === 0 || !stats) {
+    return (
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: C.muted, fontSize: 13, padding: 40 }}>
+        Not enough overlapping history yet — try again once more tickers finish caching.
+      </div>
+    );
+  }
+
+  // Build cumulative-return curves for the chart
+  const buildCurve = (key) => {
+    let cum = 1;
+    return months.map(m => {
+      cum *= 1 + m[key];
+      return { date: m.date, value: cum };
+    });
+  };
+  const portCurve = buildCurve("portRet");
+  const spyCurve  = buildCurve("spyRet");
+
+  const fmtPct = (v) => v == null ? "—" : `${v >= 0 ? "+" : ""}${(v * 100).toFixed(1)}%`;
   const retColor = (v) => v == null ? C.muted : v >= 0 ? C.gain : C.loss;
+
+  // Chart dimensions
+  const W = 900, H = 280, PAD = 40;
+  const allVals = [...portCurve.map(p => p.value), ...spyCurve.map(p => p.value)];
+  const yMin = Math.min(...allVals), yMax = Math.max(...allVals);
+  const yScale = (v) => H - PAD - ((v - yMin) / (yMax - yMin || 1)) * (H - PAD * 2);
+  const xScale = (i) => PAD + (i / (months.length - 1 || 1)) * (W - PAD * 2);
+
+  const buildPath = (curve) =>
+    curve.map((p, i) => `${i === 0 ? "M" : "L"}${xScale(i).toFixed(1)},${yScale(p.value).toFixed(1)}`).join(" ");
 
   return (
     <div style={{ flex: 1, overflowY: "auto", padding: "28px 40px", background: C.bg }}>
       <div style={{ maxWidth: 1100, margin: "0 auto" }}>
 
         {/* Header */}
-        <div style={{ marginBottom: 28, paddingBottom: 18, borderBottom: `1px solid ${C.border2}` }}>
+        <div style={{ marginBottom: 24, paddingBottom: 18, borderBottom: `1px solid ${C.border2}` }}>
           <div style={{ fontSize: 10, letterSpacing: "0.28em", color: C.muted, textTransform: "uppercase", marginBottom: 8 }}>
-            Look-back Simulation
+            Walk-Forward Backtest · {stats.years.toFixed(1)} years · monthly rebalance
           </div>
           <div style={{ fontSize: 24, fontWeight: 600, color: C.text, letterSpacing: "0.01em", marginBottom: 8 }}>
-            Portfolio vs S&P 500
+            Mom + LowVol Strategy vs S&P 500
           </div>
-          <div style={{ fontSize: 12, color: C.sub, lineHeight: 1.6, maxWidth: 760 }}>
-            "If I'd bought today's {portfolio.length} picks equal-weighted N months ago, how would I have done vs holding SPY?" Useful directional signal — see <strong style={{ color: C.text }}>caveats</strong> at bottom.
+          <div style={{ fontSize: 12, color: C.sub, lineHeight: 1.6, maxWidth: 800 }}>
+            Point-in-time backtest. Each month uses ONLY data available at that date to score and pick the top {Math.max(10, topN)} stocks. No look-ahead bias.
+            Only Momentum and Low-Vol factors are included — Quality and Value need historical fundamentals (paid data we don't have).
           </div>
         </div>
 
-        {/* Horizon comparison bars */}
-        <div style={{ marginBottom: 36 }}>
-          <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 14, fontWeight: 600 }}>
-            Return by Horizon (Equal-Weight)
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 18 }}>
-            {horizonStats.map(h => (
-              <div key={h.key} style={{ background: C.surf, border: `1px solid ${C.border}`, padding: "20px 22px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 14 }}>
-                  <span style={{ fontSize: 11, color: C.sub, letterSpacing: "0.1em", textTransform: "uppercase" }}>
-                    {h.label}
-                  </span>
-                  <span style={{ fontSize: 9, color: C.muted }}>{h.desc}</span>
-                </div>
-
-                {/* Portfolio bar */}
-                <div style={{ marginBottom: 12 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                    <span style={{ fontSize: 11, color: C.text }}>Portfolio</span>
-                    <span style={{ fontSize: 14, color: retColor(h.portRet), fontFamily: mono, fontWeight: 600 }}>
-                      {fmtRet(h.portRet)}
-                    </span>
-                  </div>
-                  <div style={{ height: 3, background: C.border2, position: "relative" }}>
-                    <div style={{
-                      position: "absolute",
-                      left: h.portRet < 0 ? `${50 - Math.min(50, Math.abs(h.portRet) / maxAbsAcrossHorizons * 50)}%` : "50%",
-                      width: `${Math.min(50, Math.abs(h.portRet ?? 0) / maxAbsAcrossHorizons * 50)}%`,
-                      height: "100%",
-                      background: retColor(h.portRet),
-                      transition: "all 0.3s",
-                    }} />
-                    <div style={{ position: "absolute", left: "50%", top: -2, width: 1, height: 7, background: C.border2 }} />
-                  </div>
-                </div>
-
-                {/* SPY bar */}
-                <div style={{ marginBottom: 16 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
-                    <span style={{ fontSize: 11, color: C.muted }}>S&P 500 (SPY)</span>
-                    <span style={{ fontSize: 13, color: C.sub, fontFamily: mono }}>
-                      {fmtRet(h.spyRet)}
-                    </span>
-                  </div>
-                  <div style={{ height: 3, background: C.border2, position: "relative" }}>
-                    <div style={{
-                      position: "absolute",
-                      left: h.spyRet < 0 ? `${50 - Math.min(50, Math.abs(h.spyRet) / maxAbsAcrossHorizons * 50)}%` : "50%",
-                      width: `${Math.min(50, Math.abs(h.spyRet ?? 0) / maxAbsAcrossHorizons * 50)}%`,
-                      height: "100%",
-                      background: C.muted,
-                    }} />
-                  </div>
-                </div>
-
-                {/* Alpha + hit rate */}
-                <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 12, display: "flex", justifyContent: "space-between" }}>
-                  <div>
-                    <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 3 }}>
-                      Alpha
-                    </div>
-                    <div style={{ fontSize: 16, fontWeight: 600, color: retColor(h.alpha), fontFamily: mono }}>
-                      {fmtRet(h.alpha)}
-                    </div>
-                  </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.1em", marginBottom: 3 }}>
-                      Hit rate
-                    </div>
-                    <div style={{ fontSize: 16, fontWeight: 600, color: h.hitRate >= 50 ? C.gain : C.loss, fontFamily: mono }}>
-                      {h.hitRate.toFixed(0)}%
-                    </div>
-                    <div style={{ fontSize: 9, color: C.muted, marginTop: 2 }}>
-                      {h.beatCount}/{portfolio.length} beat SPY
-                    </div>
-                  </div>
-                </div>
+        {/* Top-line stats */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 12, marginBottom: 28 }}>
+          {[
+            ["Total return",   fmtPct(stats.portCum),  retColor(stats.portCum)],
+            ["vs SPY",         fmtPct(stats.spyCum),   retColor(stats.spyCum)],
+            ["Annualized α",   fmtPct(stats.alphaAnnual), retColor(stats.alphaAnnual)],
+            ["Sharpe",         stats.sharpePort.toFixed(2), stats.sharpePort > stats.sharpeSpy ? C.gain : C.text],
+            ["Max DD",         fmtPct(stats.maxDD),    C.loss],
+          ].map(([lbl, val, color]) => (
+            <div key={lbl} style={{ background: C.surf, border: `1px solid ${C.border}`, padding: "14px 16px" }}>
+              <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.14em", marginBottom: 6 }}>
+                {lbl}
               </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Summary card */}
-        <div style={{ marginBottom: 36, background: C.surf, border: `1px solid ${C.border2}`, padding: "22px 26px" }}>
-          <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 14, fontWeight: 600 }}>
-            1-Year Summary
-          </div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
-            {[
-              ["Total return", fmtRet(totalContrib), retColor(totalContrib)],
-              ["vs SPY (alpha)", fmtRet(horizonStats[2].alpha), retColor(horizonStats[2].alpha)],
-              ["Winners", `${winners}/${portfolio.length}`, winners > losers ? C.gain : C.text],
-              ["Losers", `${losers}/${portfolio.length}`, losers > winners ? C.loss : C.muted],
-            ].map(([lbl, val, color]) => (
-              <div key={lbl}>
-                <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.12em", marginBottom: 6 }}>
-                  {lbl}
-                </div>
-                <div style={{ fontSize: 22, fontWeight: 600, color, fontFamily: mono }}>
-                  {val}
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* Per-stock contribution */}
-        <div style={{ marginBottom: 36 }}>
-          <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 14, fontWeight: 600 }}>
-            Per-Stock 1Y Contribution (sorted best → worst)
-          </div>
-          <div style={{ border: `1px solid ${C.border}` }}>
-            <div style={{
-              display: "grid",
-              gridTemplateColumns: "90px 1fr 130px 90px 90px 90px",
-              gap: 16, padding: "10px 16px", background: C.surf,
-              fontSize: 9, color: C.muted, letterSpacing: "0.14em",
-              textTransform: "uppercase", borderBottom: `1px solid ${C.border2}`,
-            }}>
-              <div>Ticker</div>
-              <div>Name</div>
-              <div>Sector</div>
-              <div style={{ textAlign: "right" }}>1Y Return</div>
-              <div style={{ textAlign: "right" }}>vs SPY</div>
-              <div style={{ textAlign: "right" }}>Contrib</div>
+              <div style={{ fontSize: 20, fontWeight: 600, color, fontFamily: mono }}>{val}</div>
             </div>
-            {detailed.map(s => (
-              <div key={s.ticker} style={{
-                display: "grid",
-                gridTemplateColumns: "90px 1fr 130px 90px 90px 90px",
-                gap: 16, padding: "10px 16px",
-                borderBottom: `1px solid ${C.border}`,
-                alignItems: "center",
-              }}>
-                <div style={{ fontFamily: mono, fontSize: 12, fontWeight: 600, color: C.text }}>{s.ticker}</div>
-                <div style={{ fontSize: 11, color: C.sub, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>
-                  {s.name}
-                </div>
-                <div style={{ fontSize: 10, color: C.muted, whiteSpace: "nowrap" }}>{s.sector}</div>
-                <div style={{ textAlign: "right", fontFamily: mono, fontSize: 12, color: retColor(s.ret1Y) }}>
-                  {fmtRet(s.ret1Y)}
-                </div>
-                <div style={{ textAlign: "right", fontFamily: mono, fontSize: 12, color: retColor(s.vsSpy1Y) }}>
-                  {fmtRet(s.vsSpy1Y)}
-                </div>
-                <div style={{ textAlign: "right", fontFamily: mono, fontSize: 12, color: C.text }}>
-                  {fmtRet(s.contrib1Y)}
-                </div>
-              </div>
-            ))}
+          ))}
+        </div>
+
+        {/* Cumulative return chart */}
+        <div style={{ marginBottom: 28 }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 12, fontWeight: 600 }}>
+            Cumulative Return ($1 invested at start)
+          </div>
+          <div style={{ background: C.surf, border: `1px solid ${C.border}`, padding: 16 }}>
+            <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", height: 280 }}>
+              {/* horizontal gridline at y=1 (start value) */}
+              <line x1={PAD} x2={W - PAD} y1={yScale(1)} y2={yScale(1)} stroke={C.border2} strokeDasharray="2,3" />
+              {/* SPY curve */}
+              <path d={buildPath(spyCurve)} fill="none" stroke={C.muted} strokeWidth="1.5" />
+              {/* Portfolio curve */}
+              <path d={buildPath(portCurve)} fill="none" stroke={C.text} strokeWidth="2" />
+
+              {/* Y axis labels */}
+              {[yMin, 1, yMax].map((v, i) => (
+                <text key={i} x={PAD - 8} y={yScale(v) + 4} fontSize="9" fill={C.muted} textAnchor="end" fontFamily={mono}>
+                  ${v.toFixed(2)}
+                </text>
+              ))}
+              {/* X axis labels: first, middle, last */}
+              {[0, Math.floor(months.length / 2), months.length - 1].map(i => (
+                <text key={i} x={xScale(i)} y={H - PAD + 16} fontSize="9" fill={C.muted} textAnchor="middle" fontFamily={mono}>
+                  {months[i]?.date}
+                </text>
+              ))}
+            </svg>
+            <div style={{ display: "flex", gap: 20, marginTop: 12, fontSize: 11 }}>
+              <span style={{ color: C.text }}>
+                <span style={{ display: "inline-block", width: 18, height: 2, background: C.text, verticalAlign: "middle", marginRight: 6 }} />
+                Strategy
+              </span>
+              <span style={{ color: C.muted }}>
+                <span style={{ display: "inline-block", width: 18, height: 2, background: C.muted, verticalAlign: "middle", marginRight: 6 }} />
+                SPY
+              </span>
+            </div>
           </div>
         </div>
 
-        {/* Caveats */}
+        {/* Hit rate + comparison */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 28 }}>
+          <div style={{ background: C.surf, border: `1px solid ${C.border}`, padding: "18px 20px" }}>
+            <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.12em", marginBottom: 8 }}>
+              Monthly Hit Rate vs SPY
+            </div>
+            <div style={{ fontSize: 28, fontWeight: 600, color: stats.hitRate >= 0.5 ? C.gain : C.loss, fontFamily: mono }}>
+              {(stats.hitRate * 100).toFixed(1)}%
+            </div>
+            <div style={{ fontSize: 11, color: C.sub, marginTop: 6 }}>
+              Strategy beat SPY in {Math.round(stats.hitRate * months.length)} of {months.length} months
+            </div>
+          </div>
+          <div style={{ background: C.surf, border: `1px solid ${C.border}`, padding: "18px 20px" }}>
+            <div style={{ fontSize: 10, color: C.muted, textTransform: "uppercase", letterSpacing: "0.12em", marginBottom: 8 }}>
+              Annualized Returns
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+              <span style={{ fontSize: 11, color: C.text }}>Strategy</span>
+              <span style={{ fontSize: 14, color: retColor(stats.portAnnual), fontFamily: mono, fontWeight: 600 }}>
+                {fmtPct(stats.portAnnual)}/yr
+              </span>
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between" }}>
+              <span style={{ fontSize: 11, color: C.muted }}>SPY</span>
+              <span style={{ fontSize: 13, color: C.sub, fontFamily: mono }}>
+                {fmtPct(stats.spyAnnual)}/yr
+              </span>
+            </div>
+          </div>
+        </div>
+
+        {/* Caveats — much shorter now since we eliminated look-ahead bias */}
         <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.7, paddingTop: 16, borderTop: `1px solid ${C.border}` }}>
-          <div style={{ color: C.sub, marginBottom: 8, fontWeight: 600 }}>Honest caveats — read these:</div>
+          <div style={{ color: C.sub, marginBottom: 8, fontWeight: 600 }}>Honest caveats:</div>
           <ul style={{ paddingLeft: 18, margin: 0 }}>
-            <li><strong>Look-ahead bias</strong>: picks are scored with TODAY's fundamentals, then "purchased" historically. A true institutional backtest would use point-in-time fundamentals (paid data we don't have).</li>
-            <li><strong>Survivorship bias</strong>: universe is current S&P 500 + S&P 400. Companies that got delisted or merged aren't here — so the universe is biased toward survivors.</li>
-            <li><strong>No transaction costs / taxes</strong>: real returns would be lower after slippage, commissions, and capital-gains tax.</li>
-            <li><strong>No rebalancing</strong>: the model picks once and holds. A real factor strategy rebalances monthly or quarterly.</li>
-            <li><strong>Use as a directional signal</strong>: "the factor mix beat SPY by N% over the year" → factors are doing something. Not "I'll definitely make N% next year."</li>
+            <li><strong>Only Mom + LowVol factors</strong>: Quality/Value can't be backtested without paid historical fundamentals. Their sliders don't affect the backtest result — adjust Mom vs LowVol weights to see different mixes.</li>
+            <li><strong>Survivorship bias</strong>: universe is today's S&P 500 + S&P 400. Companies that delisted/went bankrupt aren't here. Real-world results would be a few % lower.</li>
+            <li><strong>No transaction costs</strong>: monthly rebalancing in reality has slippage + commissions. Subtract ~0.5-1%/yr.</li>
+            <li><strong>Past performance ≠ future</strong>: factor premia decay, regimes change. Use as evidence the factors work historically, not as a return forecast.</li>
           </ul>
         </div>
       </div>

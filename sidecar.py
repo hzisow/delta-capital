@@ -41,6 +41,7 @@ app.add_middleware(
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CACHE_FILE = os.path.join(os.path.dirname(__file__), "stock_cache.json")
+HISTORY_CACHE_FILE = os.path.join(os.path.dirname(__file__), "history_cache.json")
 CACHE_TTL_SECONDS = 6 * 60 * 60       # refresh anything older than 6h
 THROTTLE_INTERVAL_MIN = 0.5            # aggressive — full universe in ~7 min
 THROTTLE_INTERVAL_MAX = 3.0            # backed off when Yahoo 429s
@@ -56,6 +57,11 @@ _consecutive_429s = 0
 # disk cache: { ticker: { data: {...}, ts: epoch_seconds } }
 _cache: dict[str, dict] = {}
 _cache_lock = threading.Lock()
+
+# historical monthly closes for walk-forward backtesting
+# shape: { ticker: [[yyyy-mm, adj_close], ...] }   ~60 rows per ticker
+_history: dict[str, list] = {}
+_history_lock = threading.Lock()
 
 _throttle_lock = threading.Lock()
 _last_call_ts = 0.0
@@ -89,6 +95,54 @@ def save_cache():
         os.replace(tmp, CACHE_FILE)
     except Exception as e:
         print(f"[cache] save failed: {e}")
+
+
+def load_history():
+    global _history
+    if not os.path.exists(HISTORY_CACHE_FILE):
+        print(f"[history] no history cache — backtest data will warm up")
+        return
+    try:
+        with open(HISTORY_CACHE_FILE) as f:
+            _history = json.load(f)
+        print(f"[history] loaded monthly history for {len(_history)} tickers")
+    except Exception as e:
+        print(f"[history] load failed: {e}")
+        _history = {}
+
+
+def save_history():
+    try:
+        tmp = HISTORY_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(_history, f)
+        os.replace(tmp, HISTORY_CACHE_FILE)
+    except Exception as e:
+        print(f"[history] save failed: {e}")
+
+
+def _fetch_history(ticker: str) -> list | None:
+    """Pull 5 years of monthly closes. Returns [[yyyy-mm, close], ...]."""
+    _wait_throttle()
+    try:
+        with _session_lock:
+            t = yf.Ticker(ticker, session=_yf_session)
+            hist = t.history(period="5y", interval="1mo", auto_adjust=True)
+        if hist.empty:
+            _record_response(was_429=False)
+            return None
+        out = []
+        for date, close in zip(hist.index, hist["Close"]):
+            if close == close and close > 0:   # filter NaN
+                out.append([date.strftime("%Y-%m"), round(float(close), 4)])
+        _record_response(was_429=False)
+        return out
+    except Exception as e:
+        msg = str(e)[:200]
+        is_429 = ("429" in msg or "Too Many" in msg or "Rate" in msg or "Invalid Crumb" in msg)
+        _record_response(was_429=is_429)
+        print(f"[history] {ticker}: {msg[:80]}")
+        return None
 
 
 # ── Throttle + fetch ────────────────────────────────────────────────────────
@@ -225,42 +279,61 @@ _writes_since_save = 0
 
 
 def _background_refresh_loop():
-    """Continuously: fill missing universe tickers, then refresh stale ones."""
+    """Continuously: fill missing stock data, then missing history, then refresh stale."""
     global _writes_since_save
     print("[refresh] background worker starting")
     while True:
         try:
-            ticker = _pick_next_to_refresh()
-            if not ticker:
+            picked = _pick_next_to_refresh()
+            if not picked:
                 time.sleep(60)
                 continue
-            data = _fetch_from_yahoo(ticker)
-            if data:
-                _cache_put(ticker, data)
-                _writes_since_save += 1
-                # Save to disk every 10 writes (cheap, prevents data loss on crash)
-                if _writes_since_save >= 10:
-                    save_cache()
-                    _writes_since_save = 0
-                if len(_cache) % 25 == 0:
-                    print(f"[refresh] cache size: {len(_cache)} tickers")
+            ticker, kind = picked
+
+            if kind == "stock":
+                data = _fetch_from_yahoo(ticker)
+                if data:
+                    _cache_put(ticker, data)
+                    _writes_since_save += 1
+                    if _writes_since_save >= 10:
+                        save_cache()
+                        _writes_since_save = 0
+            elif kind == "history":
+                rows = _fetch_history(ticker)
+                if rows:
+                    with _history_lock:
+                        _history[ticker] = rows
+                    _writes_since_save += 1
+                    if _writes_since_save >= 10:
+                        save_history()
+                        _writes_since_save = 0
+                    if len(_history) % 25 == 0:
+                        print(f"[refresh] history size: {len(_history)} tickers")
         except Exception as e:
             print(f"[refresh] loop error: {str(e)[:80]}")
             time.sleep(10)
 
 
-def _pick_next_to_refresh() -> str | None:
-    """(1) Universe tickers missing from cache, then (2) staleest cached ticker."""
+def _pick_next_to_refresh() -> tuple[str, str] | None:
+    """Returns (ticker, kind) where kind is 'stock' or 'history'.
+    Priority: (1) stock-missing > (2) history-missing > (3) stale stock."""
     universe = get_universe()
     with _cache_lock:
-        missing = [t for t in universe if t not in _cache]
-        if missing:
-            return missing[0]
+        stock_missing = [t for t in universe if t not in _cache]
+    if stock_missing:
+        return (stock_missing[0], "stock")
+
+    with _history_lock:
+        hist_missing = [t for t in universe if t not in _history]
+    if hist_missing:
+        return (hist_missing[0], "history")
+
+    with _cache_lock:
         if not _cache:
             return None
         ticker, entry = min(_cache.items(), key=lambda kv: kv[1]["ts"])
         if _is_stale(entry):
-            return ticker
+            return (ticker, "stock")
     return None
 
 
@@ -412,6 +485,19 @@ def stocks_bulk(force_refresh_age_s: int | None = None) -> dict:
     }
 
 
+@app.get("/historical/bulk")
+def historical_bulk() -> dict:
+    """Return monthly closing prices for every cached ticker — feeds the
+    walk-forward backtest engine in the frontend."""
+    with _history_lock:
+        history_copy = {k: v for k, v in _history.items()}
+    return {
+        "history": history_copy,
+        "count": len(history_copy),
+        "universe_count": len(get_universe()),
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     with _cache_lock:
@@ -423,9 +509,12 @@ def health() -> dict:
         else:
             avg_age_min = 0
             stale_count = 0
+    with _history_lock:
+        history_size = len(_history)
     return {
         "ok": True,
         "cache_size": size,
+        "history_size": history_size,
         "universe_size": len(get_universe()),
         "avg_age_minutes": round(avg_age_min, 1),
         "stale_count": stale_count,
@@ -439,6 +528,7 @@ def health() -> dict:
 @app.on_event("startup")
 def on_startup():
     load_cache()
+    load_history()
     get_universe()
     # Defer warmup so /health and cached requests are responsive immediately
     def delayed_start():
