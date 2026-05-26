@@ -1,0 +1,14 @@
+# Render deployment config for the Delta Capital sidecar.
+# Push this repo to GitHub, then in Render: New → Blueprint → select repo.
+services:
+  - type: web
+    name: delta-capital-sidecar
+    runtime: python
+    plan: free   # 750 hours/month — sleeps after 15 min idle, ~30s cold start
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn sidecar:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9   # curl_cffi prebuilt wheels work cleanly on 3.11

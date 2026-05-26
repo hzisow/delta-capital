@@ -1,0 +1,7 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+yfinance==0.2.55
+curl_cffi==0.7.4
+pandas==2.2.3
+lxml==5.3.0
+html5lib==1.1
