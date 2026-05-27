@@ -43,17 +43,32 @@ jobs:
           head -c 500 data.json
           echo
 
-      - name: Push data.json to data branch
+      - name: Pull existing picks_history.json from data branch (if any)
+        run: |
+          # If picks_history.json already exists on the data branch, grab it
+          # so save_picks.py can append to it.
+          if git ls-remote --exit-code --heads origin data > /dev/null 2>&1; then
+            git fetch origin data
+            git show origin/data:picks_history.json > picks_history.json 2>/dev/null || true
+          fi
+          ls -la picks_history.json 2>/dev/null || echo "no existing history yet"
+
+      - name: Run save_picks.py (weekly forward-test snapshot)
+        run: |
+          python scripts/save_picks.py
+          ls -la picks_history.json 2>/dev/null || echo "no history file produced"
+
+      - name: Push data.json + picks_history.json to data branch
         run: |
           set -e
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Save data.json out of the way before branch swap
+          # Save outputs before branch swap
           mv data.json /tmp/data.json
+          [ -f picks_history.json ] && mv picks_history.json /tmp/picks_history.json
 
-          # Check out (or create) the data branch as an orphan — it only ever
-          # contains data.json, no source history. This keeps main's history clean.
+          # Check out (or create) the data branch as an orphan
           if git ls-remote --exit-code --heads origin data > /dev/null 2>&1; then
             git fetch origin data
             git checkout data
@@ -63,10 +78,13 @@ jobs:
           fi
 
           mv /tmp/data.json data.json
+          [ -f /tmp/picks_history.json ] && mv /tmp/picks_history.json picks_history.json
+
           git add data.json
-          # Only commit if data actually changed
+          [ -f picks_history.json ] && git add picks_history.json
+
           if git diff --cached --quiet; then
-            echo "No change in data.json — skipping commit"
+            echo "No change — skipping commit"
           else
             git commit -m "data: refresh $(date -u +%Y-%m-%dT%H:%MZ)"
             git push -u origin data

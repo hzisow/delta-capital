@@ -224,8 +224,9 @@ export default function DeltaCapital() {
   const [aiLoading, setAiLoading] = useState(null);
   const [showHelp, setShowHelp]   = useState(false);
   const [lastUpdated, setLastUpdated] = useState(null);
-  const [view, setView]           = useState("screen"); // "screen" | "picks" | "backtest"
+  const [view, setView]           = useState("screen"); // "screen" | "picks" | "backtest" | "forward"
   const [history, setHistory]     = useState({});
+  const [picksHistory, setPicksHistory] = useState([]);
 
   const tick = (n = 1) => { callsRef.current += n; setCalls(callsRef.current); };
 
@@ -259,10 +260,22 @@ export default function DeltaCapital() {
       // Single static JSON, refreshed hourly by GitHub Actions.
       // Cache-busting query string makes the Refresh button bypass CDN cache.
       const url = forceRefresh ? `${DATA_URL}?t=${Date.now()}` : DATA_URL;
-      const res = await fetch(url, { cache: forceRefresh ? "no-store" : "default" });
+      const historyUrl = DATA_URL.replace(/\/data\.json/, "/picks_history.json");
+
+      const [res, picksRes] = await Promise.all([
+        fetch(url, { cache: forceRefresh ? "no-store" : "default" }),
+        fetch(historyUrl).catch(() => null),
+      ]);
       if (!res.ok) throw new Error(`Failed to load data.json (HTTP ${res.status})`);
       const payload = await res.json();
       tick(1);
+
+      if (picksRes && picksRes.ok) {
+        try {
+          const ph = await picksRes.json();
+          if (Array.isArray(ph)) setPicksHistory(ph);
+        } catch {}
+      }
 
       setHistory(payload.history || {});
       const rows = payload.stocks || [];
@@ -418,7 +431,7 @@ export default function DeltaCapital() {
 
         {/* Tab nav */}
         <div style={{ display: "flex", gap: 4 }}>
-          {[["screen", "Screen"], ["picks", "Picks"], ["backtest", "Backtest"]].map(([k, label]) => (
+          {[["screen", "Screen"], ["picks", "Picks"], ["backtest", "Backtest"], ["forward", "Forward"]].map(([k, label]) => (
             <button
               key={k}
               onClick={() => setView(k)}
@@ -835,6 +848,11 @@ export default function DeltaCapital() {
             C={C} mono={mono}
           />
         )}
+
+        {/* ── FORWARD TEST VIEW ── */}
+        {view === "forward" && (
+          <ForwardTestView picksHistory={picksHistory} scored={scored} C={C} mono={mono} />
+        )}
       </div>
 
       {/* ── HELP MODAL ── */}
@@ -910,6 +928,14 @@ export default function DeltaCapital() {
             {/* Section: returns */}
             <HelpSection title="Returns">
               <HelpItem term="1D / 1M / 3M / 1Y" def="Total price change over each window (1 day, 1 month, 3 months, 1 year). Green = positive, red = negative." />
+            </HelpSection>
+
+            {/* Section: forward test */}
+            <HelpSection title="Forward Test Tab">
+              <HelpItem term="What it is" def="Every week, the GitHub Actions cron saves a snapshot of the model's current top 20 picks with the prices at that moment. The Forward Test tab compares those locked-in prices to today's prices — pure out-of-sample performance, no look-ahead bias, no methodology games." />
+              <HelpItem term="Why this matters more than Backtest" def="Backtests look at the past with today's knowledge — you can always find a way to make them look good (data snooping). Forward tests can't — once a pick is saved, you can't go back and change it. After 6-12 months of weekly snapshots, you have honest evidence of whether the model has alpha." />
+              <HelpItem term="How long until it's meaningful" def="4 weeks = anecdote. 3 months = preliminary signal. 6-12 months = real evidence. 2+ years = statistically defensible. Be patient — this is the only honest measurement." />
+              <HelpItem term="Picks change as the model changes" def="If you adjust factor weights or improve the model, future snapshots reflect the new model. Each snapshot is a record of what THIS version of the model picked at that time." />
             </HelpSection>
 
             {/* Section: backtest */}
@@ -1345,6 +1371,205 @@ function BacktestView({ portfolio, scored, topN, weights, history, C, mono }) {
             <li><strong>Survivorship bias</strong>: universe is today's S&P 500 + S&P 400. Companies that delisted/went bankrupt aren't here. Real-world results would be a few % lower.</li>
             <li><strong>No transaction costs</strong>: monthly rebalancing in reality has slippage + commissions. Subtract ~0.5-1%/yr.</li>
             <li><strong>Past performance ≠ future</strong>: factor premia decay, regimes change. Use as evidence the factors work historically, not as a return forecast.</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Forward Test view ──────────────────────────────────────────────────────
+// True out-of-sample tracking: each weekly snapshot in picks_history.json
+// was saved with the prices at that moment. We compare those prices to
+// today's prices to compute actual realized returns. No look-ahead bias,
+// no data snooping — this is the model's real track record.
+function ForwardTestView({ picksHistory, scored, C, mono }) {
+  const spyNow = scored.find(s => s.ticker === "SPY")?.price;
+  const priceMap = useMemo(() => {
+    const m = {};
+    for (const s of scored) m[s.ticker] = s.price;
+    return m;
+  }, [scored]);
+
+  const fmtPct = (v) => v == null ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(1)}%`;
+  const retColor = (v) => v == null ? C.muted : v >= 0 ? C.gain : C.loss;
+  const daysSince = (dateStr) => {
+    const d = new Date(dateStr + "T00:00:00Z");
+    return Math.max(0, Math.round((Date.now() - d.getTime()) / 86400000));
+  };
+
+  // For each historical snapshot, compute the equal-weight return of its
+  // picks vs SPY since the snapshot date.
+  const analyzed = useMemo(() => {
+    if (!picksHistory.length || !spyNow) return [];
+    return picksHistory.map(snap => {
+      const spyAtPick = snap.spy_price_at_pick;
+      const spyReturn = (spyAtPick && spyNow) ? (spyNow / spyAtPick - 1) * 100 : null;
+
+      const pickRets = snap.picks.map(p => {
+        const cur = priceMap[p.ticker];
+        if (!cur || !p.price_at_pick) return null;
+        return (cur / p.price_at_pick - 1) * 100;
+      });
+      const validRets = pickRets.filter(r => r != null);
+      const portRet = validRets.length
+        ? validRets.reduce((a, b) => a + b, 0) / validRets.length
+        : null;
+      const alpha = (portRet != null && spyReturn != null) ? portRet - spyReturn : null;
+      const beatCount = spyReturn != null
+        ? validRets.filter(r => r > spyReturn).length : 0;
+
+      return {
+        ...snap,
+        daysSince: daysSince(snap.date),
+        portRet,
+        spyReturn,
+        alpha,
+        beatCount,
+        validRetCount: validRets.length,
+        perPickReturns: pickRets,
+      };
+    });
+  }, [picksHistory, priceMap, spyNow]);
+
+  if (!picksHistory.length) {
+    return (
+      <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", flexDirection: "column", gap: 16, color: C.muted, fontSize: 13, padding: 40 }}>
+        <div style={{ fontSize: 11, letterSpacing: "0.2em", textTransform: "uppercase", color: C.sub }}>
+          Forward Test Empty
+        </div>
+        <div style={{ maxWidth: 560, textAlign: "center", lineHeight: 1.7 }}>
+          No snapshots saved yet. The GitHub Action will save the first weekly snapshot of the model's top {20} picks on its next run.
+          <br /><br />
+          Come back in a week to see the model's first batch of picks being tracked, and in 3–6 months you'll have meaningful out-of-sample performance data — the honest answer to "does this model work?"
+        </div>
+      </div>
+    );
+  }
+
+  // Aggregate stats across all snapshots
+  const withAlpha = analyzed.filter(a => a.alpha != null);
+  const avgAlpha = withAlpha.length
+    ? withAlpha.reduce((s, a) => s + a.alpha, 0) / withAlpha.length : null;
+  const winningSnaps = withAlpha.filter(a => a.alpha > 0).length;
+  const totalPicks = analyzed.reduce((s, a) => s + a.picks.length, 0);
+  const totalBeats = analyzed.reduce((s, a) => s + a.beatCount, 0);
+  const totalValidRets = analyzed.reduce((s, a) => s + a.validRetCount, 0);
+
+  return (
+    <div style={{ flex: 1, overflowY: "auto", padding: "28px 40px", background: C.bg }}>
+      <div style={{ maxWidth: 1100, margin: "0 auto" }}>
+
+        {/* Header */}
+        <div style={{ marginBottom: 24, paddingBottom: 18, borderBottom: `1px solid ${C.border2}` }}>
+          <div style={{ fontSize: 10, letterSpacing: "0.28em", color: C.muted, textTransform: "uppercase", marginBottom: 8 }}>
+            Real Out-of-Sample Track Record · {analyzed.length} snapshot{analyzed.length === 1 ? "" : "s"}
+          </div>
+          <div style={{ fontSize: 24, fontWeight: 600, color: C.text, letterSpacing: "0.01em", marginBottom: 8 }}>
+            Forward Test
+          </div>
+          <div style={{ fontSize: 12, color: C.sub, lineHeight: 1.6, maxWidth: 800 }}>
+            Every week the model's top picks are saved with the prices at that moment. This page compares those prices to <strong style={{ color: C.text }}>today's</strong> prices — no look-ahead, no data snooping. The honest answer to "does this model pick winners?"
+            {analyzed.length < 4 && (
+              <span style={{ color: C.muted, display: "block", marginTop: 6 }}>
+                ⚠️ Only {analyzed.length} snapshot{analyzed.length === 1 ? "" : "s"} so far — too few for statistically meaningful conclusions. Come back in 3-6 months.
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Aggregate stats */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 28 }}>
+          {[
+            ["Snapshots",      analyzed.length,                                              C.text],
+            ["Avg alpha vs SPY", avgAlpha != null ? fmtPct(avgAlpha) : "—",                  retColor(avgAlpha)],
+            ["Winning snapshots", `${winningSnaps}/${withAlpha.length}`,                     winningSnaps > withAlpha.length / 2 ? C.gain : C.text],
+            ["Pick hit rate",  totalValidRets ? `${((totalBeats / totalValidRets) * 100).toFixed(0)}%` : "—", totalBeats > totalValidRets / 2 ? C.gain : C.text],
+          ].map(([lbl, val, color]) => (
+            <div key={lbl} style={{ background: C.surf, border: `1px solid ${C.border}`, padding: "14px 16px" }}>
+              <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: "0.14em", marginBottom: 6 }}>
+                {lbl}
+              </div>
+              <div style={{ fontSize: 20, fontWeight: 600, color, fontFamily: mono }}>{val}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Per-snapshot list */}
+        <div style={{ fontSize: 10, letterSpacing: "0.2em", color: C.muted, textTransform: "uppercase", marginBottom: 12, fontWeight: 600 }}>
+          Snapshots (newest first)
+        </div>
+        <div style={{ marginBottom: 32 }}>
+          {analyzed.slice().reverse().map((a, idx) => (
+            <div key={a.date} style={{ background: C.surf, border: `1px solid ${C.border}`, marginBottom: 12 }}>
+              {/* Snapshot header */}
+              <div style={{ display: "grid", gridTemplateColumns: "140px 1fr 90px 90px 90px 90px", gap: 12, padding: "12px 16px", borderBottom: `1px solid ${C.border}`, alignItems: "center" }}>
+                <div>
+                  <div style={{ fontFamily: mono, fontSize: 13, color: C.text, fontWeight: 600 }}>{a.date}</div>
+                  <div style={{ fontSize: 10, color: C.muted, marginTop: 2 }}>{a.daysSince} days ago</div>
+                </div>
+                <div style={{ fontSize: 11, color: C.muted }}>
+                  {a.picks.length} picks · spy_at_pick ${a.spy_price_at_pick?.toFixed(2)}
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, color: C.muted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 2 }}>Portfolio</div>
+                  <div style={{ fontSize: 13, fontFamily: mono, fontWeight: 600, color: retColor(a.portRet) }}>{fmtPct(a.portRet)}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, color: C.muted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 2 }}>SPY</div>
+                  <div style={{ fontSize: 13, fontFamily: mono, color: C.sub }}>{fmtPct(a.spyReturn)}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, color: C.muted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 2 }}>Alpha</div>
+                  <div style={{ fontSize: 13, fontFamily: mono, fontWeight: 600, color: retColor(a.alpha) }}>{fmtPct(a.alpha)}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, color: C.muted, letterSpacing: "0.1em", textTransform: "uppercase", marginBottom: 2 }}>Hit rate</div>
+                  <div style={{ fontSize: 13, fontFamily: mono, color: a.beatCount > a.validRetCount / 2 ? C.gain : C.text }}>
+                    {a.validRetCount ? `${Math.round((a.beatCount / a.validRetCount) * 100)}%` : "—"}
+                  </div>
+                </div>
+              </div>
+
+              {/* Per-pick details (collapsed by default for older snapshots, open for newest) */}
+              <details open={idx === 0}>
+                <summary style={{ padding: "8px 16px", fontSize: 10, color: C.muted, cursor: "pointer", letterSpacing: "0.1em", textTransform: "uppercase" }}>
+                  Show {a.picks.length} picks
+                </summary>
+                <div style={{ padding: "0 16px 12px" }}>
+                  {a.picks.map((p, i) => {
+                    const ret = a.perPickReturns[i];
+                    const vsSpy = (ret != null && a.spyReturn != null) ? ret - a.spyReturn : null;
+                    return (
+                      <div key={p.ticker} style={{ display: "grid", gridTemplateColumns: "70px 1fr 90px 80px 80px 80px", gap: 12, padding: "6px 0", fontSize: 11, borderBottom: `1px solid ${C.border}`, alignItems: "center" }}>
+                        <div style={{ fontFamily: mono, color: C.text, fontWeight: 600 }}>{p.ticker}</div>
+                        <div style={{ color: C.sub, overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis" }}>{p.name}</div>
+                        <div style={{ color: C.muted, fontSize: 10 }}>{p.sector}</div>
+                        <div style={{ textAlign: "right", fontFamily: mono, color: C.sub }}>
+                          ${p.price_at_pick?.toFixed(2)} → ${priceMap[p.ticker]?.toFixed(2) ?? "—"}
+                        </div>
+                        <div style={{ textAlign: "right", fontFamily: mono, color: retColor(ret) }}>{fmtPct(ret)}</div>
+                        <div style={{ textAlign: "right", fontFamily: mono, color: retColor(vsSpy), fontSize: 10 }}>
+                          vs spy {fmtPct(vsSpy)}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </details>
+            </div>
+          ))}
+        </div>
+
+        {/* Footer caveats */}
+        <div style={{ fontSize: 11, color: C.muted, lineHeight: 1.7, paddingTop: 16, borderTop: `1px solid ${C.border}` }}>
+          <div style={{ color: C.sub, marginBottom: 8, fontWeight: 600 }}>What this is and isn't:</div>
+          <ul style={{ paddingLeft: 18, margin: 0 }}>
+            <li><strong>Real out-of-sample data</strong>: prices were locked when the snapshot was saved. No look-ahead, no data snooping. This is the honest test.</li>
+            <li><strong>Equal-weighted, no rebalancing</strong>: each pick contributes equally; performance shown is "buy and hold from pick date."</li>
+            <li><strong>No transaction costs / taxes</strong>: real returns would be a few % lower.</li>
+            <li><strong>Statistically meaningful only with many snapshots</strong>: 4-12 weeks is anecdote, 6-12 months is signal, 2+ years is evidence. Be patient.</li>
+            <li><strong>Picks change over time</strong>: weights can change, the model can change, the universe can change. Each snapshot reflects the model AT THAT TIME.</li>
           </ul>
         </div>
       </div>
