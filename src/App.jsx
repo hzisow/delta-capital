@@ -38,8 +38,29 @@ const percentile = (v, arr, invert = false) => {
   return invert ? 100 - rank : rank;
 };
 
+// Percentile rank within a specific subset of indices. Returns an array of
+// scores aligned to the original `raw` array; positions outside `indices`
+// get a neutral 50.
+const percentileWithin = (raw, indices, invert = false) => {
+  const out = new Array(raw.length).fill(50);
+  const subset = indices.map(i => raw[i]).filter(v => v != null && isFinite(v));
+  if (subset.length < 2) return out;  // not enough peers to rank meaningfully
+  const sorted = [...subset].sort((a, b) => a - b);
+  for (const i of indices) {
+    const v = raw[i];
+    if (v == null || !isFinite(v)) { out[i] = 50; continue; }
+    const rank = Math.round((sorted.filter(x => x < v).length / (sorted.length - 1 || 1)) * 100);
+    out[i] = invert ? 100 - rank : rank;
+  }
+  return out;
+};
+
+const SECTOR_MIN_PEERS = 5;  // below this, a sector falls back to global rank
+
 const scoreAll = (stocks) => {
   if (!stocks.length) return stocks;
+
+  // Step 1: compute raw factor values across the whole universe
   const momRaw  = stocks.map(s => s.ret1Y != null && s.ret1M != null ? s.ret1Y - s.ret1M : null);
   const qualRaw = stocks.map(s => {
     if (s.roeTTM == null) return null;
@@ -56,12 +77,55 @@ const scoreAll = (stocks) => {
     return (ey ?? 0) * 0.4 + (ipb ?? 0) * 0.35 + (iev ?? 0) * 0.25;
   });
   const betaRaw = stocks.map(s => s.beta);
+
+  // Step 2: group stock indices by sector
+  const sectorIdx = {};
+  stocks.forEach((s, i) => {
+    const sec = s.sector || "Unknown";
+    (sectorIdx[sec] = sectorIdx[sec] || []).push(i);
+  });
+
+  // Step 3: rank within each sector that has enough peers. Small sectors
+  // fall back to global rank (otherwise everyone gets 50 and the factor
+  // loses signal).
+  const momScore  = new Array(stocks.length).fill(50);
+  const qualScore = new Array(stocks.length).fill(50);
+  const valScore  = new Array(stocks.length).fill(50);
+  const volScore  = new Array(stocks.length).fill(50);
+  const allIdx    = stocks.map((_, i) => i);
+
+  // Pre-compute global rankings once (used for small-sector fallback)
+  const globalMom  = percentileWithin(momRaw,  allIdx);
+  const globalQual = percentileWithin(qualRaw, allIdx);
+  const globalVal  = percentileWithin(valRaw,  allIdx);
+  const globalVol  = percentileWithin(betaRaw, allIdx, true);
+
+  for (const [sec, idxs] of Object.entries(sectorIdx)) {
+    if (idxs.length >= SECTOR_MIN_PEERS) {
+      // Sector-neutral: rank within this sector's peer group
+      const m = percentileWithin(momRaw,  idxs);
+      const q = percentileWithin(qualRaw, idxs);
+      const v = percentileWithin(valRaw,  idxs);
+      const l = percentileWithin(betaRaw, idxs, true);
+      for (const i of idxs) {
+        momScore[i] = m[i]; qualScore[i] = q[i];
+        valScore[i] = v[i]; volScore[i] = l[i];
+      }
+    } else {
+      // Tiny sector — fall back to global rank
+      for (const i of idxs) {
+        momScore[i] = globalMom[i];  qualScore[i] = globalQual[i];
+        valScore[i] = globalVal[i];  volScore[i] = globalVol[i];
+      }
+    }
+  }
+
   return stocks.map((s, i) => ({
     ...s,
-    momentumScore: percentile(momRaw[i],  momRaw),
-    qualityScore:  percentile(qualRaw[i], qualRaw),
-    valueScore:    percentile(valRaw[i],  valRaw),
-    lowVolScore:   percentile(betaRaw[i], betaRaw, true),
+    momentumScore: momScore[i],
+    qualityScore:  qualScore[i],
+    valueScore:    valScore[i],
+    lowVolScore:   volScore[i],
     hasFullData:   momRaw[i] != null && qualRaw[i] != null,
   }));
 };
@@ -817,7 +881,9 @@ export default function DeltaCapital() {
             {/* Section: model */}
             <HelpSection title="The Model">
               <HelpItem term="Composite Score" def="A weighted average of the four factor scores below, rescaled 0–100. Higher is better. The four weights (sliders in the sidebar) determine how much each factor contributes." />
-              <HelpItem term="Percentile Rank" def="Each factor score is a percentile rank across all enriched stocks in the universe. A score of 80 means the stock is in the top 20% on that factor; 50 is the median." />
+              <HelpItem term="Sector-Neutral Ranking" def="Each factor score is a percentile rank WITHIN the stock's GICS sector — not against the whole universe. AAPL's P/E gets compared to other tech stocks, not utilities. This is how real factor funds (AQR, BlackRock, etc.) score stocks. A score of 80 means top 20% in that sector on that factor." />
+              <HelpItem term="Why sector-neutral matters" def="Tech naturally trades at higher P/Es than energy; utilities run higher debt than software. Without sector adjustment, a 'value' score would just identify cheap sectors, not cheap stocks within their peer group. Sector-neutral isolates the stock-specific signal." />
+              <HelpItem term="Small-sector fallback" def="If a sector has fewer than 5 stocks in the universe (rare), those stocks get ranked globally instead — otherwise we'd be comparing one stock to nothing." />
               <HelpItem term="Portfolio" def="The top N stocks by composite score (N is set by the Portfolio Size buttons). Stocks missing key fundamentals are excluded — they show greyed-out in the table." />
             </HelpSection>
 
@@ -1551,7 +1617,7 @@ function PicksView({ portfolio, display, weights, topN, C, mono }) {
 
         {/* Disclaimer */}
         <div style={{ fontSize: 10, color: C.muted, lineHeight: 1.7, paddingTop: 16, borderTop: `1px solid ${C.border}` }}>
-          Equal-weight allocation. Conviction score = composite × (1 + analyst implied upside / 30). Sector cap: 30% per sector. Model output based on your current factor weights — adjust the sliders to re-rank. Educational tool, not investment advice.
+          Equal-weight allocation. Conviction score = composite × (1 + analyst implied upside / 30). Sector cap: 30% per sector. Factor scores are sector-neutral (ranked vs peers in the same GICS sector). Model output based on your current factor weights — adjust the sliders to re-rank. Educational tool, not investment advice.
         </div>
       </div>
     </div>
